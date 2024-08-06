@@ -1,0 +1,515 @@
+---
+title: "Differential_Analysis_Stepniak_ChiP_H3K27me3_0,2"
+author: "Alizée LANON"
+date: "2024-05-06"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  warning = FALSE,     # Suppress warnings from R code
+  message = FALSE     
+)
+```
+###Process of the data
+The raw data were processed using nf-core v2.14.1 chipseq v2.0.0 pipeline on the IFB cluster with the following command line:
+"
+sbatch --wrap="\
+nextflow run nf-core/chipseq -profile ifb_core -resume -r 2.0.0\
+                --input ./Glioma/Stepniak/ChiPseq/samplesheet_ChIPseq_2.csv \
+                --outdir ./Glioma/Stepniak/ChiPseq/nextflow2/ \
+                --fasta ./Glioma/save/RESSOURCES/REFERENCES/GRCh38/Homo_sapiens.GRCh38.dna_sm.primary_assembly.fa \
+                --gtf ./Glioma/save/RESSOURCES/REFERENCES/GRCh38/Homo_sapiens.GRCh38.108.gtf \
+                --bwa_index ./Glioma/save/RESSOURCES/REFERENCES/GRCh38/bwa \
+                --blacklist ./Glioma/save/RESSOURCES/REFERENCES/GRCh38/hg38-blacklist.v2.bed \
+                --save_unaligned \
+                --narrow_peak \
+                --macs_gsize 2652783500"
+"
+### Import 
+```{r, message=FALSE}
+library(ggplot2)
+library(BiocStyle)
+
+#--> Phenotypic matrix 
+pdata <- read.csv("pdata/pdata_chip_H3K27me3.csv", sep =";", header = TRUE)
+row.names(pdata) <- pdata$Sample
+
+#--> Count matrix
+mrna_raw_counts <- read.delim(file = "../../../../../Glioma/Stepniak/ChiPseq/Count_matrix/H3K27me3.consensus_peaks.featureCounts.txt", header = TRUE, sep = "\t")
+row.names(mrna_raw_counts) <- mrna_raw_counts$Geneid
+mrna_raw_counts_table <- mrna_raw_counts[,c(7,8,9,11,13,14)]
+
+#--> Order and match
+mrna_raw_counts_table <- mrna_raw_counts[,match(pdata$Sample, colnames(mrna_raw_counts), nomatch = 0)]
+pdata <- pdata[pdata$Sample %in% colnames(mrna_raw_counts),]
+
+mrna_raw_counts_info <- mrna_raw_counts[,c(1,2,3,4,5)]
+#--> Feature annotation
+mrna_gene <- read.table("../../../../../Glioma/Stepniak/ChiPseq/Count_matrix/H3K27me3.consensus_peaks.featureCounts.txt", header = TRUE)[,c(1)]
+```
+### Filter 
+The filtering of the genes is the step that allows to filter out the genes that are not expressed in any of the conditions. To do so, the package HTSFilter (v1.24.0) was used. It takes as an input the raw count matrix as well as an object in which each samples is associated at its experimental group (IDHwt or IDHmut). As we are in ChiPseq data, this step is not necessary because this method only detects accessible chromatin area.
+```{r, message=FALSE}
+#--> Filter lowly expressed genes
+library(HTSFilter)
+
+mrna_filter <- HTSFilter(round(mrna_raw_counts_table),
+                         pdata$Group,
+                         s.min=1, s.max=200)
+```
+### Normalization 
+The forst normalization is done with the EDAseq package (v2.28.0) to conduct a "between lane normalization" (to look at sequencing depth and other distributional differences between lanes). Then edgeR package (v1.36.0) is used to perform the differential analysis. First, a DGEList object is created, we apply to this object a normalization by the library size. As edgeR based its analysis on the hypothesis of a negative binomial dispersion of the genes expression, the function "estimateGLMRobustDisp" is applied to perform a robust estimation of the dispersion parameter for each gene.
+```{r, message=FALSE}
+library(RUVSeq)
+library(reshape)
+library(EDASeq)
+
+#--> Quantile normalization
+raw_set <- newSeqExpressionSet(counts = as.matrix(mrna_filter$filteredData))
+colnames(raw_set) <- pdata$Sample
+qn_set <- betweenLaneNormalization(raw_set, which = "full")
+
+#--> edgeR TMM normalization
+library(edgeR)
+
+tmm_set <-  mrna_filter$filteredData
+
+pdata_tmm <- pdata
+design <- cbind(model.matrix(~ 0 + pdata_tmm$Group))
+colnames(design) <- gsub(".*\\$|)", "", colnames(design))
+
+tmm_set <- DGEList(counts = tmm_set,
+                   genes = mrna_gene,
+                   group = pdata_tmm$Group)
+
+tmm_set <- calcNormFactors(tmm_set)
+
+#--> Estimate dispersion and fit the model
+tmm_set <- estimateGLMRobustDisp(tmm_set, design)
+```
+### Quality Check
+The quality check is perform to look at the distributio of gene expression after normalization. It allows to see if a sample is an outlier and if so, which normalization corrects "better" this outlier to align with other samples.
+```{r, message=FALSE}
+##### Boxplot
+library(plotly)
+#--> Get data
+bp_full <- rbind(melt(log2(mrna_filter$filteredData + 1)),
+                 melt(log2(normCounts(qn_set) + 1)),
+                 melt(cpm(tmm_set, normalized.lib.sizes = TRUE, log = TRUE)))
+
+#--> Build the data.frame
+bp_full$Method <- rep(c("Before QN", "After QN", "After TMM"),
+                      each = nrow(mrna_filter$filteredData) *    ncol(mrna_filter$filteredData))
+
+bp_full$Method <- factor(bp_full$Method, levels = c("Before QN",
+                                                    "After QN",
+                                                    "After TMM"))
+
+colnames(bp_full) <- c("Gene", "Sample", "Expression", "Method")
+
+bp_full <- merge(bp_full, pdata,
+                 by.x = "Sample", by.y = "Sample",
+                 all = TRUE)
+
+#--> Compute statistics
+calc_stat <- function(x) {
+  coef <- 1.5
+  n <- sum(!is.na(x))
+  stats <- quantile(x, probs = c(0.1, 0.25, 0.5, 0.75, 0.9))
+  names(stats) <- c("ymin", "lower", "middle", "upper", "ymax")
+  return(stats)
+}
+
+#--> Build the plot                 
+bp <- ggplot(bp_full, aes(x = Sample, y = Expression, fill = Group, text = Sample)) + 
+  stat_summary(fun.data = calc_stat, geom = "boxplot") +
+  facet_wrap(~Method, scales = "free_y") +
+  ggtitle("Distribution of gene expression")  +
+  ylab("Expression (logCPM)") + xlab("") +
+  theme() +  # Call the theme function with parentheses
+  theme(axis.text.x = element_text(angle = 90, hjust = 1), legend.position = "none")
+
+
+ggplotly(bp)
+
+```
+### PCA prcomp
+Then, the factoextra package (v1.0.7), dependencie of FactoMineR package (v2.4) was used to perform Principal Component Analysis, an unsupervised clustering method. It was performed with two differents functions, you can chose and only keep one for further analysis.
+```{r, message=FALSE}
+library(ggrepel)
+library(FactoMineR)
+library(factoextra)
+#-->  Creating the expression matrices
+data_pca_before_qn <- log2(mrna_filter$filteredData + 1)
+data_pca_after_qn  <- log2(normCounts(qn_set) + 1)
+data_pca_after_tmm <- cpm(tmm_set, normalized.lib.sizes = TRUE, log = TRUE)
+
+#-->  Computing PCA
+pca_before_qn   <- as.data.frame(prcomp(t(na.omit(data_pca_before_qn)), scale. = TRUE, center = TRUE)$x)
+
+pca_after_qn    <- as.data.frame(prcomp(t(na.omit(data_pca_after_qn)), scale. = FALSE, center = TRUE)$x) 
+
+pca_after_tmm   <- as.data.frame(prcomp(t(na.omit(data_pca_after_tmm)), scale. = TRUE, center = TRUE)$x)
+
+#-->  Combine
+comb <- data.frame(rbind(
+  pca_before_qn[,c(1:2)],
+  pca_after_qn[,c(1:2)],
+  pca_after_tmm[,c(1:2)]),
+  PCA = rep(c("Before QN", "After QN",
+              "After TMM"), each = nrow(pdata)),
+  Sample = pdata$Sample,
+  Group = pdata$Group)
+colnames(comb) <- c("PC1", "PC2", "PCA", "Sample","Group")
+
+comb$PCA <- factor(comb$PCA, levels = c("Before QN", "After QN",
+                                        "After TMM"))
+
+#-->  Plot
+pca_plot <- ggplot(comb, aes(x= PC1, y = PC2)) + 
+  geom_point(aes(color = Group,
+                 text = Sample)) +
+  facet_wrap(~PCA, nrow = 2, scales = "free") +
+  ggtitle("PCA - Normalization")  +
+  theme()
+
+ggplotly(pca_plot)
+```
+### PCA method 2
+```{r, message=FALSE}
+library(ggrepel)
+library(FactoMineR)
+library(factoextra)
+#-->  Creating the expression matrices
+data_pca_before_qn <- log2(mrna_filter$filteredData + 1)
+data_pca_after_qn  <- log2(normCounts(qn_set) + 1)
+data_pca_after_tmm <- cpm(tmm_set, normalized.lib.sizes = TRUE, log = TRUE)
+
+#-->  Computing PCA
+res_data_pca_before_qn <- PCA(t(na.omit(data_pca_before_qn)), scale.unit = TRUE,graph = FALSE)
+
+plot_data_pca_before_qn <- fviz_pca_ind(res_data_pca_before_qn, title = "Pca of DA samples before qn",
+             col.ind = pdata$Group, # color by groups
+             palette = c("#D60000", "#4294D8"),
+             legend.title = "Groups",
+             ylim = c(-200, 200), xlim = c(-350,250))
+
+res_data_pca_after_qn <- PCA(t(na.omit(data_pca_after_qn)), scale.unit = TRUE,graph = FALSE)
+
+plot_data_pca_after_qn <- fviz_pca_ind(res_data_pca_after_qn, title = "Pca of DA samples after qn",
+             col.ind = pdata$Group, # color by groups
+             palette = c("#D60000", "#4294D8"),
+             legend.title = "Groups",
+             ylim = c(-200, 150), xlim = c(-250,250))
+
+res_data_pca_after_tmm <- PCA(t(na.omit(data_pca_after_tmm)), scale.unit = TRUE,graph = FALSE)
+
+plot_data_pca_after_tmm <- fviz_pca_ind(res_data_pca_after_tmm, title = "Pca of DA samples after tmm",
+             col.ind = pdata$Group, # color by groups
+             palette = c("#D60000", "#4294D8"),
+             legend.title = "Groups",
+             ylim = c(-200, 200), xlim = c(-250,250))
+
+## Plot 
+par(mfrow = c(1, 3))
+print(plot_data_pca_before_qn)
+print(plot_data_pca_after_qn)
+print(plot_data_pca_after_tmm)
+
+```
+### Differential level of modification analysis
+Then, the "glmFit" function is used to fit a generalized linear model to the count data. Afterwards, based on the fitted GLM model, the function "glmLRT" is used to conduct a likelihood ratio test to identify differentially expressed genes. Next, we extract the top differentially expressed genes, we then adjust their p-values for multiple testing with the method "False Discovery Rate" and we filter out the genes with an adjusted p-value above 0.1
+```{r, message=FALSE}
+### ANOVA like test
+#--> Estimate dispersion and fit the model
+tmm_fit <- glmFit(tmm_set, design = design)
+
+################################################
+#--> ANOVA-like test
+lrt_full <- glmLRT(tmm_fit,
+                   contrast =  makeContrasts(IDHmut_vs_IDHwt = GroupIDHmut - GroupIDHwt,
+                                             levels = design))
+
+#--> List DE genes and correct for multiple testing
+top_full <- topTags(lrt_full, n = Inf)$table
+top <- topTags(lrt_full, adjust.method = "fdr",
+               p.value = 0.2,  n = Inf)$table
+
+# Extract fold change values and gene names
+fold_changes <- top$logFC
+gene_names <- top$genes
+
+# Identify up-regulated and down-regulated genes
+upregulated_loci <- gene_names[fold_changes > 0]
+up_loci_Grange <- mrna_raw_counts_info[upregulated_loci,]
+
+downregulated_loci <- gene_names[fold_changes < 0]
+down_loci_Grange <- mrna_raw_counts_info[downregulated_loci,]
+```
+### EXTRACT THE 5000 LOCI WITH HIGHEST LOGfc FOR INTEGRATIVE ANALYSIS 
+Not a step of differential analysis but only to extract the 5000 loci (2500 positive logFC and 2500 negative logFC) for an integrative analysis.
+```{r, message = FALSE}
+library(dplyr)
+top_complete <- top_full
+#sorted_genes_top <- top_complete[order(top_complete$logFC), ]
+
+sorted_genes_df_desc <- top_complete %>%
+  arrange(desc(logFC))
+
+sorted_genes_df_asc <- top_complete %>%
+  arrange(logFC)
+
+sorted_genes_df_desc_top <- sorted_genes_df_desc[1:2500,]
+sorted_genes_df_asc_top <- sorted_genes_df_asc[1:2500,]
+
+sorted_genes_df_top <- rbind(sorted_genes_df_desc_top, sorted_genes_df_asc_top)
+#write.table(sorted_genes_df_top, "../../../Integrative_Analysis/Data/5000_peaks_logFC_H3K27me3_Stepniak.csv", row.names = FALSE)
+```
+### Hierarchical clustering
+In order to vizualize those results, a heatmap was chosen as a representation. This representation,in addition to allowing the vizualization of the clusters of dysregulated loci among the samples, it also allows the display of clusterized samples. To do so, we perform upstream a k-means clustering (or hierarchical clustering) with the factoextra and cluster (v2.1.2) packages and the "ward.D2" method. Finally, the heatmap is created with the package pheatmap (v1.0.12) and the function of the same name.
+```{r, message=FALSE}
+library(pheatmap)
+library(viridis)
+
+#--> Select ID of DE genes
+sel_hm <- top$genes
+
+#--> Get expression matrix
+counts_mrna <- edgeR::cpm(tmm_set, normalized.lib.sizes = TRUE, log = TRUE)
+sel_hm_mrna <- counts_mrna[match(sel_hm, row.names(counts_mrna), nomatch = 0),]
+
+#write.table(counts_mrna,"../../../Integrative_Analysis/Data/counts_ChIP_H3K27me3_Stepniak_norm.csv", row.names = TRUE)
+
+library(cluster)
+library(factoextra)
+
+#create plot of number of clusters vs total within sum of squares
+#fviz_nbclust(counts_mrna, kmeans, method = "wss")
+
+#--> Perform K-means clustering
+clustering_hc <-  hclust(as.dist(1-cor(t(sel_hm_mrna))), method = "ward.D2")
+clusters <- cutree(tree = clustering_hc , k = 2)
+
+#--> Order genes
+sel_hm_mrna <- sel_hm_mrna[clustering_hc$order,]
+
+#--> Create row annotation matrix
+annot_row = data.frame(row.names = row.names(sel_hm_mrna),
+                       cluster = as.factor(clusters[clustering_hc$order]))
+
+#--> Create column annotation matrix
+pdata_chip <- pdata
+colnames(sel_hm_mrna) <- row.names(pdata_chip)
+
+# Annotation Colors
+annotation_colors <- list(
+  Group = c("IDHmut" = "#D60000", "IDHwt" = "#4294D8")    # Colors for column annotations
+)
+
+#--> Build the heatmap
+pheatmap(sel_hm_mrna,
+         scale = "row",
+         cluster_rows = FALSE,
+         cluster_cols = TRUE, show_rownames = FALSE,
+         clustering_method  = "ward.D2",
+         clustering_distance_cols = "correlation",
+         annotation_row = annot_row["cluster"],
+         annotation_col = pdata[2],
+         main = "Clustering ",
+         color = viridis(100),
+         labels_row = NA,
+         fontsize = 6,
+         border_color = NA,
+         annotation_colors = annotation_colors)
+```
+### Table
+```{r, message=FALSE}
+#library(DT)
+
+#table <- merge(top, annot_row, by = "row.names")
+
+#datatable(table[,-c(1,12,13)], extensions = "Buttons",
+#          options = list(buttons = c("csv", "excel"))) %>%
+#  formatRound(columns = c(3:9), digits=2)
+```
+### Peak Annotation
+Peak annotation is the step where for each loci we attribute the name of a gene. Several methods exists bbut here we used the nearest gene method.
+I used ChIPpeakAnno package (v3.28.1), to attribute to each loci the name of the closest gene.
+```{r, message=FALSE}
+library(ChIPpeakAnno)
+library(EnsDb.Hsapiens.v86)
+library(org.Hs.eg.db)
+library(biomaRt)
+
+gr_upreg <- GRanges(
+    seqnames = Rle(up_loci_Grange$Chr),
+    ranges = IRanges(start = up_loci_Grange$Start, end = up_loci_Grange$End),
+    strand = Rle(strand(up_loci_Grange$Strand)))
+
+gr_downreg <- GRanges(
+    seqnames = Rle(down_loci_Grange$Chr),
+    ranges = IRanges(start = down_loci_Grange$Start, end = down_loci_Grange$End),
+    strand = Rle(strand(down_loci_Grange$Strand)))
+
+ensembl_hs86_transcript <- transcripts(EnsDb.Hsapiens.v86)
+
+macs_peak_ensembl_upreg <- annotatePeakInBatch(gr_upreg, 
+                                         AnnotationData = ensembl_hs86_transcript)
+
+macs_peak_ensembl_downreg <- annotatePeakInBatch(gr_downreg, 
+                                         AnnotationData = ensembl_hs86_transcript)
+
+ens_t_id_up <- macs_peak_ensembl_upreg$feature
+
+ens_t_id_down <- macs_peak_ensembl_downreg$feature
+
+# Retrieve gene IDs and gene names for the given transcript IDs
+mart <- useMart(biomart = "ENSEMBL_MART_ENSEMBL",
+                dataset = "hsapiens_gene_ensembl")
+
+
+macs_peak_ensembl_upregID <- addGeneIDs(annotatedPeak = macs_peak_ensembl_upreg, 
+                                mart = mart,
+                                feature_id_type = "ensembl_transcript_id",
+                                IDs2Add = "hgnc_symbol")
+
+macs_peak_ensembl_downregID <- addGeneIDs(annotatedPeak = macs_peak_ensembl_downreg, 
+                                mart = mart,
+                                feature_id_type = "ensembl_transcript_id",
+                                IDs2Add = "hgnc_symbol")
+
+genes_upreg <- macs_peak_ensembl_upregID$hgnc_symbol
+
+genes_downreg <- macs_peak_ensembl_downregID$hgnc_symbol
+
+metabo_genes_all <- read.table("../../Lists_genes/all_metabo.tsv", header = TRUE, sep = "\t")
+metabo_genes <- metabo_genes_all$Gene_name
+
+metabo_up <- intersect(metabo_genes,genes_upreg)
+metabo_down <- intersect(metabo_genes,genes_downreg)
+
+genes_upreg
+genes_downreg
+metabo_up
+metabo_down
+```
+### Comparison with differential analysis
+We compared the results obtaines with differential analysis results
+```{r, message=FALSE}
+genes_Stepniak_upreg_metabo <- read.csv("../RNA/lists_dysreg_genes_stepniak/upregulated_metabo_genes_DA.csv", header = TRUE)
+genes_Stepniak_downreg_metabo <- read.csv("../RNA/lists_dysreg_genes_stepniak/downregulated_metabo_genes_DA.csv", header = TRUE)
+
+genes_Jigna_downreg_metabo <- read.csv("../../Differential_Analysis_Jigna/lists_genes_up_down_jigna_data/downregulated_metabo_genes_Jigna_samples.csv", header = TRUE)
+genes_Jigna_upreg_metabo <- read.csv("../../Differential_Analysis_Jigna/lists_genes_up_down_jigna_data/upregulated_metabo_genes_Jigna_samples.csv", header = TRUE)
+
+list_genes_diff_analysis_1 <- append(genes_Jigna_downreg_metabo$x, genes_Jigna_upreg_metabo$x)
+list_genes_diff_analysis_2 <- append(genes_Stepniak_downreg_metabo$x, genes_Stepniak_upreg_metabo$x)
+list_genes_diff_analysis_1 <- unlist(list_genes_diff_analysis_1)
+list_genes_diff_analysis_2 <- unlist(list_genes_diff_analysis_2)
+
+list_genes_diff_analysis <- append(list_genes_diff_analysis_1,list_genes_diff_analysis_2)
+
+
+loci_upreg <- intersect(list_genes_diff_analysis, genes_upreg)
+loci_downreg <- intersect(list_genes_diff_analysis,genes_downreg)
+
+```
+### Comparison with H3K4me3
+We compare with H3K4me3 because a combination between those two marks can signify an activation or repression of a promotor depending on the combination of the marks.
+```{r, message = FALSE}
+list_genes_upreg_H3K4me3 <- read.csv("Lists_genes_locis_dysreg/genes_upreg_H3K4me3.csv", header = TRUE)
+list_genes_downreg_H3K4me3 <- read.csv("Lists_genes_locis_dysreg/genes_downreg_H3K4me3.csv", header = TRUE)
+list_metabo_upreg_H3K4me3 <- read.csv("Lists_genes_locis_dysreg/genes_metabo_upreg_H3K4me3.csv", header = TRUE)
+list_metabo_downreg_H3K4me3 <- read.csv("Lists_genes_locis_dysreg/genes_metabo_downreg_H3K4me3.csv", header = TRUE)
+
+genes_H3K4me3up_H3K27acup <- intersect(list_genes_upreg_H3K4me3$x,genes_upreg)
+genes_H3K4me3down_H3K27acdown <- intersect(list_genes_downreg_H3K4me3$x,genes_downreg)
+genes_H3K4me3up_H3K27acdown <- intersect(list_genes_upreg_H3K4me3$x,genes_downreg)
+genes_H3K4me3down_H3K27acup <- intersect(list_genes_downreg_H3K4me3$x,genes_upreg)
+
+metabo_up_between_2_marks <- intersect(metabo_genes, genes_H3K4me3up_H3K27acup)
+metabo_down_between_2_marks <- intersect(metabo_genes, genes_H3K4me3down_H3K27acdown)
+
+genes_H3K4me3up_H3K27acup
+genes_H3K4me3down_H3K27acdown
+metabo_up_between_2_marks
+metabo_down_between_2_marks
+
+
+intersect(genes_H3K4me3up_H3K27acdown, metabo_genes)
+intersect(genes_H3K4me3down_H3K27acup, metabo_genes)
+```
+### Enrichment Analysis GREAT
+The last analysis performed here is an enrichment analysis using GREAT.
+It allows to know in which pathway are enriched the information given by the modified histons marks.
+```{r, message = FALSE}
+library(rGREAT)
+
+######## UP
+new_seqlevels_up <- paste0("chr", seqlevels(gr_upreg))
+
+seqlevels(gr_upreg) <- new_seqlevels_up
+
+# Now update the seqnames with the "chr" prefix
+new_seqnames_up <- paste0("chr", seqnames(gr_upreg))
+
+GREAT_up <- submitGreatJob(gr_upreg, 
+    bg = NULL,
+    species               = "hg38",
+    includeCuratedRegDoms = TRUE,
+    rule                  = c("basalPlusExt"),
+    adv_upstream          = 5.0,
+    adv_downstream        = 1.0,
+    adv_span              = 1000.0,
+    request_interval = 60,
+    max_tries = 10,
+    version =  "4.0.4",
+    base_url = "http://great.stanford.edu/public/cgi-bin",
+    help = TRUE)
+
+enrichment_table_up <- getEnrichmentTables(GREAT_up)
+
+#enrichment_table_up$`GO Molecular Function`
+#enrichment_table_up$`GO Biological Process`
+#enrichment_table_up$`GO Cellular Component`
+
+#write.table(enrichment_table_up$`GO Molecular Function`, "Enrich_table_GO_H3K27me3/enrichment_table_up_H3K27me3_GO_molecular_function.csv", row.names = FALSE, sep =";" )
+#write.table(enrichment_table_up$`GO Biological Process`, "Enrich_table_GO_H3K27me3/enrichment_table_up_H3K27me3_GO_biological_process.csv", row.names = FALSE, sep =";" )
+#write.table(enrichment_table_up$`GO Cellular Component`, "Enrich_table_GO_H3K27me3/enrichment_table_up_H3K27me3_GO_cellular_component.csv", row.names = FALSE, sep =";" )
+
+######## DOWN
+filtered_gr_downreg <- gr_downreg[!grepl("^GL", as.character(seqnames(gr_downreg)))]
+gr_downreg <- filtered_gr_downreg
+
+new_seqlevels_down <- paste0("chr", seqlevels(gr_downreg))
+
+seqlevels(gr_downreg) <- new_seqlevels_down
+
+# Now update the seqnames with the "chr" prefix
+new_seqnames_down <- paste0("chr", seqnames(gr_downreg))
+
+
+GREAT_down <- submitGreatJob(gr_downreg, 
+    bg = NULL,
+    species               = "hg38",
+    includeCuratedRegDoms = TRUE,
+    rule                  = c("basalPlusExt"),
+    adv_upstream          = 5.0,
+    adv_downstream        = 1.0,
+    adv_span              = 1000.0,
+    request_interval = 60,
+    max_tries = 10,
+    version =  "4.0.4",
+    base_url = "http://great.stanford.edu/public/cgi-bin",
+    help = TRUE)
+
+enrichment_table_down <- getEnrichmentTables(GREAT_down)
+#enrichment_table_down$`GO Molecular Function`
+#enrichment_table_down$`GO Biological Process`
+#enrichment_table_down$`GO Cellular Component`
+
+#write.table(enrichment_table_down$`GO Molecular Function`, "Enrich_table_GO_H3K27me3/enrichment_table_down_H3K27me3_GO_molecular_function.csv", row.names = FALSE, sep =";" )
+#write.table(enrichment_table_down$`GO Biological Process`, "Enrich_table_GO_H3K27me3/enrichment_table_down_H3K27me3_GO_biological_process.csv", row.names = FALSE, sep =";" )
+#write.table(enrichment_table_down$`GO Cellular Component`, "Enrich_table_GO_H3K27me3/enrichment_table_down_H3K27me3_GO_cellular_component.csv", row.names = FALSE, sep =";" )
+
+```

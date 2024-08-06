@@ -1,0 +1,759 @@
+---
+title: "Differential_Analysis_Jigna_data_only_GFsamples"
+author: "Alizée LANON"
+date: "2024-04-19"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  warning = FALSE,     # Suppress warnings from R code
+  message = FALSE     
+)
+```
+
+### Import 
+```{r, message=FALSE}
+library(ggplot2)
+library(BiocStyle)
+
+#--> Phenotypic matrix 
+# DA02_RNAseq2_S13;IDHwt
+pdata <- read.csv("pdata_Jigna.csv", sep =";", header = TRUE)
+#pdata <- pdata[-6,]
+row.names(pdata) <- pdata$Sample
+
+#--> Count matrix
+mrna_raw_counts <- read.table("../../../../Glioma/Hugnot/data/salmon.merged.gene_counts_Jigna.tsv", header = TRUE)
+row.names(mrna_raw_counts) <- mrna_raw_counts$gene_id
+mrna_raw_counts <- mrna_raw_counts[,-c(1:2)]
+mrna_raw_counts <- mrna_raw_counts[,c(1,3,5,7,9,11,13,15)]
+
+#--> Order and match
+mrna_raw_counts <- mrna_raw_counts[,match(pdata$Sample, colnames(mrna_raw_counts), nomatch = 0)]
+pdata <- pdata[pdata$Sample %in% colnames(mrna_raw_counts),]
+
+#--> Feature annotation
+mrna_gene <- read.table("../../../../Glioma/Hugnot/data/salmon.merged.gene_counts_Jigna.tsv", header = TRUE)[,c(1:2)]
+```
+### Filter 
+The filtering of the genes is the step that allows to filter out the genes that are not expressed in any of the conditions. To do so, the package HTSFilter (\textit{v1.24.0}) was used. It takes as an input the raw count matrix as well as an object in which each samples is associated at its experimental group (IDHwt or IDHmut).
+```{r, message=FALSE}
+#--> Filter lowly expressed genes
+library(HTSFilter)
+
+mrna_filter <- HTSFilter(round(mrna_raw_counts),
+                         pdata$Group,
+                         s.min=1, s.max=200)
+```
+### Normalization 
+The forst normalization is done with the EDAseq package (v2.28.0) to conduct a "between lane normalization" (to look at sequencing depth and other distributional differences between lanes). Then edgeR package (v1.36.0) is used to perform the differential analysis. First, a DGEList object is created, we apply to this object a normalization by the library size. As edgeR based its analysis on the hypothesis of a negative binomial dispersion of the genes expression, the function "estimateGLMRobustDisp" is applied to perform a robust estimation of the dispersion parameter for each gene.
+```{r, message=FALSE}
+library(RUVSeq)
+library(reshape)
+library(EDASeq)
+
+#--> Quantile normalization
+raw_set <- newSeqExpressionSet(counts = as.matrix(mrna_filter$filteredData))
+colnames(raw_set) <- pdata$Sample
+qn_set <- betweenLaneNormalization(raw_set, which = "full")
+
+#--> edgeR TMM normalization
+library(edgeR)
+
+tmm_set <-  mrna_filter$filteredData
+
+pdata_tmm <- pdata
+design <- cbind(model.matrix(~ 0 + pdata_tmm$Group))
+colnames(design) <- gsub(".*\\$|)", "", colnames(design))
+
+tmm_set <- DGEList(counts = tmm_set,
+                   genes = mrna_gene[match(
+                     row.names(mrna_filter$filteredData), 
+                     mrna_gene$gene_id),],
+                   group = pdata_tmm$Group)
+
+tmm_set <- calcNormFactors(tmm_set)
+
+#--> Estimate dispersion and fit the model
+tmm_set <- estimateGLMRobustDisp(tmm_set, design)
+```
+### Quality Check
+The quality check is perform to look at the distributio of gene expression after normalization. It allows to see if a sample is an outlier and if so, which normalization corrects "better" this outlier to align with other samples.
+```{r, message=FALSE}
+##### Boxplot
+library(plotly)
+#--> Get data
+bp_full <- rbind(melt(log2(mrna_filter$filteredData + 1)),
+                 melt(log2(normCounts(qn_set) + 1)),
+                 melt(cpm(tmm_set, normalized.lib.sizes = TRUE, log = TRUE)))
+
+#--> Build the data.frame
+bp_full$Method <- rep(c("Before QN", "After QN", "After TMM"),
+                      each = nrow(mrna_filter$filteredData) *    ncol(mrna_filter$filteredData))
+
+bp_full$Method <- factor(bp_full$Method, levels = c("Before QN",
+                                                    "After QN",
+                                                    "After TMM"))
+
+colnames(bp_full) <- c("Gene", "Sample", "Expression", "Method")
+
+bp_full <- merge(bp_full, pdata,
+                 by.x = "Sample", by.y = "Sample",
+                 all = TRUE)
+
+#--> Compute statistics
+calc_stat <- function(x) {
+  coef <- 1.5
+  n <- sum(!is.na(x))
+  stats <- quantile(x, probs = c(0.1, 0.25, 0.5, 0.75, 0.9))
+  names(stats) <- c("ymin", "lower", "middle", "upper", "ymax")
+  return(stats)
+}
+
+#--> Build the plot                 
+bp <- ggplot(bp_full, aes(x = Sample, y = Expression, fill = Group, text = Sample)) + 
+  stat_summary(fun.data = calc_stat, geom = "boxplot") +
+  facet_wrap(~Method, scales = "free_y") +
+  ggtitle("Distribution of gene expression")  +
+  ylab("Expression (logCPM)") + xlab("") +
+  theme() +  # Call the theme function with parentheses
+  theme(axis.text.x = element_text(angle = 90, hjust = 1), legend.position = "none")
+
+
+ggplotly(bp)
+
+```
+### PCA prcomp
+Then, the factoextra package (v1.0.7), dependencie of FactoMineR package (v2.4) was used to perform Principal Component Analysis, an unsupervised clustering method. It was performed with two differents functions, you can chose and only keep one for further analysis.
+```{r, message=FALSE}
+library(ggrepel)
+library(FactoMineR)
+library(factoextra)
+#-->  Creating the expression matrices
+data_pca_before_qn <- log2(mrna_filter$filteredData + 1)
+data_pca_after_qn  <- log2(normCounts(qn_set) + 1)
+data_pca_after_tmm <- cpm(tmm_set, normalized.lib.sizes = TRUE, log = TRUE)
+
+#-->  Computing PCA
+pca_before_qn   <- as.data.frame(prcomp(t(na.omit(data_pca_before_qn)), scale. = TRUE, center = TRUE)$x)
+
+pca_after_qn    <- as.data.frame(prcomp(t(na.omit(data_pca_after_qn)), scale. = FALSE, center = TRUE)$x) 
+
+pca_after_tmm   <- as.data.frame(prcomp(t(na.omit(data_pca_after_tmm)), scale. = TRUE, center = TRUE)$x)
+
+#-->  Combine
+comb <- data.frame(rbind(
+  pca_before_qn[,c(1:2)],
+  pca_after_qn[,c(1:2)],
+  pca_after_tmm[,c(1:2)]),
+  PCA = rep(c("Before QN", "After QN",
+              "After TMM"), each = nrow(pdata)),
+  Sample = pdata$Sample,
+  Group = pdata$Group)
+colnames(comb) <- c("PC1", "PC2", "PCA", "Sample","Group")
+
+comb$PCA <- factor(comb$PCA, levels = c("Before QN", "After QN",
+                                        "After TMM"))
+
+#-->  Plot
+pca_plot <- ggplot(comb, aes(x= PC1, y = PC2)) + 
+  geom_point(aes(color = Group,
+                 text = Sample)) +
+  facet_wrap(~PCA, nrow = 2, scales = "free") +
+  ggtitle("PCA - Normalization")  +
+  theme()
+
+ggplotly(pca_plot)
+```
+### PCA pca
+```{r, message=FALSE}
+library(ggrepel)
+library(FactoMineR)
+library(factoextra)
+#-->  Creating the expression matrices
+data_pca_before_qn <- log2(mrna_filter$filteredData + 1)
+data_pca_after_qn  <- log2(normCounts(qn_set) + 1)
+data_pca_after_tmm <- cpm(tmm_set, normalized.lib.sizes = TRUE, log = TRUE)
+
+#-->  Computing PCA
+res_data_pca_before_qn <- PCA(t(na.omit(data_pca_before_qn)), scale.unit = TRUE,graph = FALSE)
+
+plot_data_pca_before_qn <- fviz_pca_ind(res_data_pca_before_qn, title = "Pca of DA samples before qn",
+             col.ind = pdata$Group, # color by groups
+             palette = c("#D60000", "#4294D8"),
+             legend.title = "Groups",
+             ylim = c(-150, 100), xlim = c(-250,250))
+
+res_data_pca_after_qn <- PCA(t(na.omit(data_pca_after_qn)), scale.unit = TRUE,graph = FALSE)
+
+plot_data_pca_after_qn <- fviz_pca_ind(res_data_pca_after_qn, title = "Pca of DA samples after qn",
+             col.ind = pdata$Group, # color by groups
+             palette = c("#D60000", "#4294D8"),
+             legend.title = "Groups",
+             ylim = c(-100, 100), xlim = c(-250,250))
+
+res_data_pca_after_tmm <- PCA(t(na.omit(data_pca_after_tmm)), scale.unit = TRUE,graph = FALSE)
+
+plot_data_pca_after_tmm <- fviz_pca_ind(res_data_pca_after_tmm, title = "Pca of DA samples after tmm",
+             col.ind = pdata$Group, # color by groups
+             palette = c("#D60000", "#4294D8"),
+             legend.title = "Groups",
+             ylim = c(-150, 150), xlim = c(-250,250))
+
+## Plot 
+par(mfrow = c(1, 3))
+print(plot_data_pca_before_qn)
+print(plot_data_pca_after_qn)
+print(plot_data_pca_after_tmm)
+
+```
+### Differential expression analysis
+Then, the "glmFit" function is used to fit a generalized linear model to the count data. Afterwards, based on the fitted GLM model, the function "glmLRT" is used to conduct a likelihood ratio test to identify differentially expressed genes. Next, we extract the top differentially expressed genes, we then adjust their p-values for multiple testing with the method "False Discovery Rate" and we filter out the genes with an adjusted p-value above 0.1
+```{r, message=FALSE}
+### ANOVA like test
+#--> Estimate dispersion and fit the model
+tmm_fit <- glmFit(tmm_set, design = design)
+
+################################################
+#--> ANOVA-like test
+lrt_full <- glmLRT(tmm_fit,
+                   contrast =  makeContrasts(IDHmut_vs_IDHwt = GroupIDHmut - GroupIDHwt,
+                                             levels = design))
+
+#--> List DE genes and correct for multiple testing
+top_full <- topTags(lrt_full, n = Inf)$table
+top <- topTags(lrt_full, adjust.method = "fdr",
+               p.value = 0.1,  n = Inf)$table
+
+# Extract fold change values and gene names
+fold_changes <- top$logFC
+gene_names <- top$gene_name
+
+# Identify up-regulated and down-regulated genes
+upregulated_genes <- gene_names[fold_changes > 0]
+#write.table(upregulated_genes, "upregulated_genes_Jigna_samples.csv", row.names = FALSE)
+
+downregulated_genes <- gene_names[fold_changes < 0]
+#write.table(downregulated_genes, "downregulated_genes_Jigna_samples.csv", row.names = FALSE)
+```
+### Venn Diagram 
+It is a visualization method to extract the dysregulated genes that are part of the metabolim gene list from Toulouse.
+```{r, message=FALSE}
+## BiocManager::install("ggvenn")
+library(ggvenn)
+
+########### Upregulated ##############
+metabo_genes_all <- read.table("../Lists_genes/all_metabo.tsv", header = TRUE, sep = "\t")
+metabo_genes <- metabo_genes_all$Gene_name
+x = list(Upregulated = upregulated_genes, Metabolism = metabo_genes)
+# Create the Venn diagram
+venn_plot_upreg <- ggvenn(
+  x,
+)
+name_genes_metabo_upreg  <- intersect(metabo_genes, upregulated_genes)
+#write.table(name_genes_metabo_upreg, "upregulated_metabo_genes_Jigna_samples.csv", row.names = FALSE)
+
+########## Downregulated ############
+y = list(Downregulated = downregulated_genes, Metabolism = metabo_genes)
+# Create the Venn diagram
+venn_plot_downreg <- ggvenn(
+  y
+)
+name_genes_metabo_downreg  <- intersect(metabo_genes, downregulated_genes)
+#write.table(name_genes_metabo_downreg, "downregulated_metabo_genes_Jigna_samples.csv", row.names = FALSE)
+print(venn_plot_upreg)
+print(venn_plot_downreg)
+```
+### Hierarchical clustering
+In order to vizualize those results, a heatmap was chosen as a representation. This representation,in addition to allowing the vizualization of the clusters of dysregulated genes among the samples, it also allows the display of clusterized samples. To do so, we perform upstream a k-means clustering (or hierarchical clustering) with the factoextra and cluster (v2.1.2) packages and the "ward.D2" method. Finally, the heatmap is created with the package pheatmap (v1.0.12) and the function of the same name.
+```{r, message=FALSE}
+library(pheatmap)
+library(viridis)
+
+#--> Select ID of DE genes
+sel_hm <- top$gene_id
+
+#--> Get expression matrix
+counts_mrna <- edgeR::cpm(tmm_set, normalized.lib.sizes = TRUE, log = TRUE)
+sel_hm_mrna <- counts_mrna[match(sel_hm, row.names(counts_mrna), nomatch = 0),]
+
+library(cluster)
+library(factoextra)
+
+#create plot of number of clusters vs total within sum of squares
+#fviz_nbclust(counts_mrna, kmeans, method = "wss")
+
+#--> Perform K-means clustering
+clustering_hc <-  hclust(as.dist(1-cor(t(sel_hm_mrna))), method = "ward.D2")
+clusters <- cutree(tree = clustering_hc , k = 2)
+
+#--> Order genes
+sel_hm_mrna <- sel_hm_mrna[clustering_hc$order,]
+
+#--> Create row annotation matrix
+annot_row = data.frame(row.names = row.names(sel_hm_mrna),
+                       cluster = as.factor(clusters[clustering_hc$order]))
+annot_row <- data.frame(Cluster = merge(annot_row, mrna_gene,
+                                        by.x = "row.names", by.y = "gene_id")$cluster,
+                        HGNC = merge(annot_row, mrna_gene,
+                                     by.x = "row.names", by.y = "gene_id")$gene_name,
+                        Ensembl = merge(annot_row, mrna_gene,
+                                        by.x = "row.names", by.y = "gene_id")$Row.names)
+row.names(annot_row) <- make.names(annot_row$HGNC, unique = TRUE)
+################################################################################
+genes_clusters_1 <- annot_row[annot_row$Cluster == 1, ]
+list_genes_clusters1 <- unlist(genes_clusters_1$HGNC)
+name_genes_metabo_clust1  <- intersect(metabo_genes, list_genes_clusters1)
+
+genes_clusters_2 <- annot_row[annot_row$Cluster == 2, ]
+list_genes_clusters2 <- unlist(genes_clusters_2$HGNC)
+name_genes_metabo_clust2  <- intersect(metabo_genes, list_genes_clusters2)
+
+genes_clusters_3 <- annot_row[annot_row$Cluster == 3, ]
+list_genes_clusters3 <- unlist(genes_clusters_3$HGNC)
+name_genes_metabo_clust3  <- intersect(metabo_genes, list_genes_clusters3)
+
+genes_clusters_4 <- annot_row[annot_row$Cluster == 4, ]
+list_genes_clusters4 <- unlist(genes_clusters_4$HGNC)
+name_genes_metabo_clust4  <- intersect(metabo_genes, list_genes_clusters4)
+
+genes_clusters_5 <- annot_row[annot_row$Cluster == 5, ]
+list_genes_clusters5 <- unlist(genes_clusters_5$HGNC)
+name_genes_metabo_clust5  <- intersect(metabo_genes, list_genes_clusters5)
+
+################################################################################
+#--> Create column annotation matrix
+pdata_rna <- pdata
+colnames(sel_hm_mrna) <- row.names(pdata_rna)
+row.names(sel_hm_mrna) <- annot_row[match(row.names(sel_hm_mrna), annot_row$Ensembl),]$HGNC
+
+# Annotation Colors
+annotation_colors <- list(
+  Group = c("IDHmut" = "#D60000", "IDHwt" = "#4294D8")    # Colors for column annotations
+)
+
+#--> Build the heatmap
+pheatmap(sel_hm_mrna,
+         scale = "row",
+         cluster_rows = FALSE,
+         cluster_cols = TRUE, show_rownames = FALSE,
+         clustering_method  = "ward.D2",
+         clustering_distance_cols = "correlation",
+         annotation_row = annot_row["Cluster"],
+         annotation_col = pdata[2],
+         main = "Clustering ",
+         color = viridis(100),
+         labels_row = NA,
+         fontsize = 6,
+         annotation_colors = annotation_colors)
+```
+### Over representation analysis Reactome
+The Over reprensation Analysis by using functions created by the Dr Pierre François ROUX to see in which pathways the dysregulated genes are enriched. Here in REACTOME database
+```{r, message=FALSE}
+#---> Split genes according to the module they belong to
+probes <- split(annot_row$HGNC,
+                f = annot_row$Cluster)
+
+#--->  Over-representation analysis
+library(ReactomePA)
+library(clusterProfiler)
+library(stringr)
+library(stringi)
+library(data.table)
+library(scales)
+library(plotly)
+
+#--> Load annotations
+gmt <- list.files("/shared/projects/gliomep53/Stage_M2/Scripts_R/Differential_Analysis/gmt_file/reactome/", full.names = TRUE)
+
+#gmt <- read.gmt("/shared/projects/gliomep53/Scripts_R/Differential_Analysis/gmt_file/reactomev2023.txt")
+
+#--> Create a formatting function for gene names
+format <- function(x) {
+  
+  b <- gregexpr("/", x)[[1]]
+  
+  if (length(b) > 10) {
+    stri_sub_all(x, from = b[seq(from = 10, to = length(b), by = 10)], length = 1) <- " \n "
+    x <- gsub("/", " ", x)
+    
+  }else{
+    x <- gsub("/", " ", x)
+  }
+  
+  return(x)
+}
+
+#--> Create a function for over-representation analysis
+or_analysis <- function(gmt) {
+  
+  gmt <- read.gmt(gmt)
+  
+  fun_enrich_res <- data.frame(compareCluster(probes,
+                                              fun='enricher',
+                                              TERM2GENE=gmt,
+                                              pvalueCutoff =1,
+                                              qvalueCutoff =.2,
+                                              minGSSize = 10))
+  
+  sel <- tapply(fun_enrich_res$Description,
+                INDEX = fun_enrich_res$Cluster,
+                function(x) {y <- x[c(1:5)]
+                return(y)})
+  sel <- unlist(sel)
+  
+  fun_enrich_res_2 <- fun_enrich_res[fun_enrich_res$Description %in%sel,]
+  
+  for (i in sel) {
+    if (nrow(fun_enrich_res_2[which(fun_enrich_res_2$Description == i),]) > 1) {
+      min_p <- min(fun_enrich_res_2[which(fun_enrich_res_2$Description == i),]$pvalue)
+      fun_enrich_res_2[which(fun_enrich_res_2$pvalue > min_p &
+                               fun_enrich_res_2$Description == i),]$qvalue <- NA
+    }}
+  
+  #fun_enrich_res_2 <- fun_enrich_res[which(fun_enrich_res$p.adjust < .1),]
+  
+  #--> Format names
+  fun_enrich_res_2 <- na.omit(fun_enrich_res_2)
+  
+  #--> Order
+  fun_enrich_res_2$Description <- factor(fun_enrich_res_2$Description,
+                                         levels = unique(fun_enrich_res_2$Description))
+  
+  #--> Convert to gene ratios to percent
+  fun_enrich_res_2$Percent <- unlist(lapply(strsplit(fun_enrich_res_2$GeneRatio, "/"), function(x){as.numeric(x[1])/as.numeric(x[2])}*100))
+  
+  #--> Format gene names
+  fun_enrich_res_2$geneID <- lapply(fun_enrich_res_2$geneID, format)
+  
+  return(list(Res = fun_enrich_res_2,
+              Levels = levels(fun_enrich_res_2$Description)))
+}
+
+#--> Apply over-representation tests
+test <- lapply(gmt, or_analysis)
+
+#--> Format the output
+test_2 <- list(test[[1]]$Res)
+
+names(test_2) <- c("Reactome")
+
+test_2 <- rbindlist(test_2, use.names = TRUE, idcol = "Database")
+
+test_2$Description <- as.factor(test_2$Description)
+
+levels(test_2$Description) <- c(test[[1]]$Levels)
+
+test_2$Description <- gsub("REACTOME_|", "", test_2$Description)
+test_2$Description <- gsub("_", " ", test_2$Description)
+test_2$Description <- str_to_sentence(test_2$Description)
+test_2$Description <- factor(test_2$Description, levels = unique(test_2$Description))
+
+#--> Plot
+p <- ggplot(test_2, aes(y = Description,
+                        x = Cluster,
+                        color = -log10(qvalue),
+                        size = Percent)) +
+  geom_point(shape = 16, stroke = .5, aes(text = gsub("/", " ", geneID))) +
+  scale_color_gradient(low = "firebrick1", high = "chartreuse3") +
+  facet_wrap(vars(Database), scales = "free_y", ncol = 1) +
+  theme() + 
+  scale_y_discrete(labels = label_wrap(70)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        axis.text.y = element_text(size = 8),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.margin = margin(10, 10, 10, 200))
+
+ggplotly(p)
+```
+### Over representation analysis KEGG metabo
+The Over reprensation Analysis by using functions created by the Dr Pierre François ROUX to see in which pathways the dysregulated genes are enriched. Here in KEGG Metabolism database
+```{r, message=FALSE}
+#---> Split genes according to the module they belong to
+probes <- split(annot_row$HGNC,
+                f = annot_row$Cluster)
+
+#--->  Over-representation analysis
+library(ReactomePA)
+library(clusterProfiler)
+library(stringr)
+library(stringi)
+library(data.table)
+library(scales)
+
+#--> Load annotations
+library(gage)
+library(org.Hs.eg.db)
+
+#--> Load annotations
+#gmt <- list.files("/shared/projects/gliomep53/Scripts_R/Differential_Analysis/gmt_file/", full.names = TRUE)
+
+####################
+gene_symbols_up <- c("AASS","SLC6A15","SLC4A4","COMT","ZDHHC8","SLC7A5","ACSBG1","LIPA","SIAE","ST8SIA4","ABCD3","SLC12A4","PPCS","TPST2","GAD1","DCTD","ATP1B2","GDPD2","RNF128","RDH5","HS6ST1","
+PDE5A","ITPKB","EPHX1","AMT","PAM","CHST7","HS3ST3A1","ZDHHC12","BDH1","PLPP3","RNF149","SLC15A2","PIP4K2C","SLC16A4","PFKFB3","ZDHHC23","B3GLCT","COLGALT2","MT-ND5","MT-CO1","MT-ND4","MT-ND1","MT-ATP6","LCAT","MT-ATP8","AMY2B")
+
+kegg_df_up <- bitr(gene_symbols_up, fromType = "SYMBOL", toType = c("UNIPROT","SYMBOL"),org.Hs.eg.db, drop = FALSE)
+
+kegg_df_up_final <- bitr_kegg(kegg_df_up$UNIPROT, fromType = "uniprot", toType = "kegg", organism = "hsa", drop = FALSE)
+
+#write.table(kegg_df_up_final, "list_genes_up_reg_KEGGid_1.csv",sep = ",")
+#write.table(kegg_df_up, "list_genes_up_reg_KEGGid_2.csv",sep = ",")
+
+##########################################
+gene_symbols_down <- c("CYP26B1","FMO3","ATP1A2","SLC18A1","SIRT2","ST6GAL1","NOS1","MTAP","PLA2G3","SLC32A1","RNF125","SMPD3","QPRT","ATP6V0A4","CYP3A5","SOD3","MVK","ODC1","PADI2","ARG1","ACAT2","SARDH","GAL3ST1","PXDN","CHI3L1","DGKB","HECW2","MMAB","CYP1A1","ALDH1L1","MAT1A","RNF144A","ACSL1","TDO2","GUCY1A2","NMNAT2","EXTL1","GALNT14","ACE","IP6K3","SLC22A15","MGMT","CYP4F11","CARNS1","ABO","PLAAT3","SLC47A2","GALNT9","CHST6","MARCHF11","ACP7","ACOT1","ALDH1A3","ENPP1","PLPP4","NEU4")
+
+kegg_df_down <- bitr(gene_symbols_down, fromType = "SYMBOL", toType = c("UNIPROT","SYMBOL"),org.Hs.eg.db, drop = FALSE)
+
+kegg_df_down_final <- bitr_kegg(kegg_df_down$UNIPROT, fromType = "uniprot", toType = "kegg", organism = "hsa", drop = FALSE)
+
+#write.table(kegg_df_down_final, "list_genes_down_reg_KEGGid_1.csv",sep = ",")
+#write.table(kegg_df_down, "list_genes_down_reg_KEGGid_2.csv",sep = ",")
+####################
+
+#--> Load KEGG annotation
+kegg <- kegg.gsets(species = "hsa", id.type = "entrez")
+ 
+#--> Select KEGG metabolic pathways
+kegg.met <- kegg$kg.sets[kegg$met.idx]
+ 
+#--> Map gene gene_name to Entrez ID
+kegg.met_2 <- lapply(kegg.met, function(x) {mapIds(org.Hs.eg.db,x, 'SYMBOL', 'ENTREZID')})
+names(kegg.met_2) <- names(kegg.met)
+
+kegg.met_2 <- melt(kegg.met_2)
+kegg.met_2 <- kegg.met_2[,c(2,1)]
+colnames(kegg.met_2) <- c("term", "gene")
+
+#--> Create a formatting function for gene names
+format <- function(x) {
+  
+  b <- gregexpr("/", x)[[1]]
+  
+  if (length(b) > 10) {
+    stri_sub_all(x, from = b[seq(from = 10, to = length(b), by = 10)], length = 1) <- " \n "
+    x <- gsub("/", " ", x)
+    
+  }else{
+    x <- gsub("/", " ", x)
+  }
+  
+  return(x)
+}
+
+#--> Create a function for over-representation analysis
+or_analysis <- function(gmt) {
+  
+  #gmt <- read.gmt(gmt)
+  gmt <- gmt
+  
+  fun_enrich_res <- data.frame(compareCluster(probes,
+                                              fun='enricher',
+                                              TERM2GENE=gmt,
+                                              pvalueCutoff =1,
+                                              qvalueCutoff =1,
+                                              minGSSize = 10))
+  
+  sel <- tapply(fun_enrich_res$Description,
+                INDEX = fun_enrich_res$Cluster,
+                function(x) {y <- x[c(1:10)]
+                return(y)})
+  sel <- unlist(sel)
+  
+  fun_enrich_res_2 <- fun_enrich_res[fun_enrich_res$Description %in%sel,]
+  length(fun_enrich_res_2)
+  
+  for (i in sel) {
+    if (nrow(fun_enrich_res_2[which(fun_enrich_res_2$Description == i),]) > 1) {
+      min_p <- min(fun_enrich_res_2[which(fun_enrich_res_2$Description == i),]$pvalue)
+      fun_enrich_res_2[which(fun_enrich_res_2$pvalue > min_p &
+                               fun_enrich_res_2$Description == i),]$qvalue <- NA
+    }}
+  
+  #fun_enrich_res_2 <- fun_enrich_res[which(fun_enrich_res$p.adjust < .1),]
+  
+  #--> Format names
+  fun_enrich_res_2 <- na.omit(fun_enrich_res_2)
+  
+  #--> Order
+  fun_enrich_res_2$Description <- factor(fun_enrich_res_2$Description,
+                                         levels = unique(fun_enrich_res_2$Description))
+  
+  #--> Convert to gene ratios to percent
+  fun_enrich_res_2$Percent <- unlist(lapply(strsplit(fun_enrich_res_2$GeneRatio, "/"), function(x){as.numeric(x[1])/as.numeric(x[2])}*100))
+  
+  #--> Format gene names
+  fun_enrich_res_2$geneID <- lapply(fun_enrich_res_2$geneID, format)
+  
+  return(list(Res = fun_enrich_res_2,
+              Levels = levels(fun_enrich_res_2$Description)))
+}
+
+#--> Apply over-representation tests
+test <- lapply(list(kegg.met_2), or_analysis)
+
+#--> Format the output
+test_2 <- list(test[[1]]$Res)
+
+names(test_2) <- c("KEGG")
+
+test_2 <- rbindlist(test_2, use.names = TRUE, idcol = "Database")
+
+test_2$Description <- as.factor(test_2$Description)
+
+levels(test_2$Description) <- c(test[[1]]$Levels)
+
+test_2$Description <- gsub("KEGG_|", "", test_2$Description)
+test_2$Description <- gsub("_", " ", test_2$Description)
+test_2$Description <- str_to_sentence(test_2$Description)
+test_2$Description <- factor(test_2$Description, levels = unique(test_2$Description))
+
+#write.table(test_2, "Kegg_metabo_pathway_list.xl")
+#write.table(test_2, "Kegg_metabo_pathway_list.csv")
+#fwrite(test_2, "Kegg_metabo_pathway_list2.csv")
+
+#--> Plot
+p <- ggplot(test_2, aes(y = Description,
+                        x = Cluster,
+                        color = -log10(qvalue),
+                        size = Percent)) +
+  geom_point(shape = 16, stroke = .5, aes(text = gsub("/", " ", geneID))) +
+  scale_color_gradient(low = "firebrick1", high = "chartreuse3") +
+  facet_wrap(vars(Database), scales = "free_y", ncol = 1) +
+  theme() + 
+  scale_y_discrete(labels = label_wrap(70)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        axis.text.y = element_text(size = 8),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.margin = margin(10, 10, 10, 200))
+
+ggplotly(p)
+```
+### Over representation analysis KEGG
+The Over reprensation Analysis by using functions created by the Dr Pierre François ROUX to see in which pathways the dysregulated genes are enriched. Here in KEGG database
+```{r, message=FALSE}
+#---> Split genes according to the module they belong to
+probes <- split(annot_row$HGNC,
+                f = annot_row$Cluster)
+
+#--->  Over-representation analysis
+library(ReactomePA)
+library(clusterProfiler)
+library(stringr)
+library(stringi)
+library(data.table)
+library(scales)
+
+#--> Load annotations
+gmt <- list.files("/shared/projects/gliomep53/Stage_M2/Scripts_R/Differential_Analysis/gmt_file/kegg/", full.names = TRUE)
+
+#--> Create a formatting function for gene names
+format <- function(x) {
+  
+  b <- gregexpr("/", x)[[1]]
+  
+  if (length(b) > 10) {
+    stri_sub_all(x, from = b[seq(from = 10, to = length(b), by = 10)], length = 1) <- " \n "
+    x <- gsub("/", " ", x)
+    
+  }else{
+    x <- gsub("/", " ", x)
+  }
+  
+  return(x)
+}
+
+#--> Create a function for over-representation analysis
+or_analysis <- function(gmt) {
+  
+  gmt <- read.gmt(gmt)
+  
+  fun_enrich_res <- data.frame(compareCluster(probes,
+                                              fun='enricher',
+                                              TERM2GENE=gmt,
+                                              pvalueCutoff =1,
+                                              qvalueCutoff =.2,
+                                              minGSSize = 10))
+  
+  sel <- tapply(fun_enrich_res$Description,
+                INDEX = fun_enrich_res$Cluster,
+                function(x) {y <- x[c(1:5)]
+                return(y)})
+  sel <- unlist(sel)
+  
+  fun_enrich_res_2 <- fun_enrich_res[fun_enrich_res$Description %in%sel,]
+  
+  for (i in sel) {
+    if (nrow(fun_enrich_res_2[which(fun_enrich_res_2$Description == i),]) > 1) {
+      min_p <- min(fun_enrich_res_2[which(fun_enrich_res_2$Description == i),]$pvalue)
+      fun_enrich_res_2[which(fun_enrich_res_2$pvalue > min_p &
+                               fun_enrich_res_2$Description == i),]$qvalue <- NA
+    }}
+  
+  #fun_enrich_res_2 <- fun_enrich_res[which(fun_enrich_res$p.adjust < .1),]
+  
+  #--> Format names
+  fun_enrich_res_2 <- na.omit(fun_enrich_res_2)
+  
+  #--> Order
+  fun_enrich_res_2$Description <- factor(fun_enrich_res_2$Description,
+                                         levels = unique(fun_enrich_res_2$Description))
+  
+  #--> Convert to gene ratios to percent
+  fun_enrich_res_2$Percent <- unlist(lapply(strsplit(fun_enrich_res_2$GeneRatio, "/"), function(x){as.numeric(x[1])/as.numeric(x[2])}*100))
+  
+  #--> Format gene names
+  fun_enrich_res_2$geneID <- lapply(fun_enrich_res_2$geneID, format)
+  
+  return(list(Res = fun_enrich_res_2,
+              Levels = levels(fun_enrich_res_2$Description)))
+}
+
+#--> Apply over-representation tests
+test <- lapply(gmt, or_analysis)
+
+#--> Format the output
+test_2 <- list(test[[1]]$Res)
+
+names(test_2) <- c("Kegg")
+
+test_2 <- rbindlist(test_2, use.names = TRUE, idcol = "Database")
+
+test_2$Description <- as.factor(test_2$Description)
+
+levels(test_2$Description) <- c(test[[1]]$Levels)
+
+test_2$Description <- gsub("Kegg_|", "", test_2$Description)
+test_2$Description <- gsub("_", " ", test_2$Description)
+test_2$Description <- str_to_sentence(test_2$Description)
+test_2$Description <- factor(test_2$Description, levels = unique(test_2$Description))
+
+#--> Plot
+p <- ggplot(test_2, aes(y = Description,
+                        x = Cluster,
+                        color = -log10(qvalue),
+                        size = Percent)) +
+  geom_point(shape = 16, stroke = .5, aes(text = gsub("/", " ", geneID))) +
+  scale_color_gradient(low = "firebrick1", high = "chartreuse3") +
+  facet_wrap(vars(Database), scales = "free_y", ncol = 1) +
+  theme() + 
+  scale_y_discrete(labels = label_wrap(70)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        axis.text.y = element_text(size = 8),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.margin = margin(10, 10, 10, 200))
+
+ggplotly(p)
+```
+### Table
+```{r, message=FALSE}
+library(DT)
+
+table <- merge(top, annot_row, by = "row.names")
+
+datatable(table[,-c(1,12,13)], extensions = "Buttons",
+          options = list(buttons = c("csv", "excel"))) %>%
+  formatRound(columns = c(3:9), digits=2)
+```

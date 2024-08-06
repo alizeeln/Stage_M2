@@ -1,0 +1,477 @@
+---
+title: "Integrative_Analysis_RNA_chip"
+author: "Alizée LANON"
+date: "2024-06-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  warning = FALSE,     # Suppress warnings from R code
+  message = FALSE     
+)
+```
+### Retrieving the data and keep only the 5000 genes via their value of logFold change during Differential Analysis
+```{r, message=FALSE}
+library(mixOmics)
+# Loading the data
+RNA_counts <- read.csv("../../../Glioma/Stepniak/Integrative_Analysis/Data/counts_RNA_Stepniak_norm.csv", header = TRUE, sep = " ")
+RNA_genes <- read.csv("../../../Glioma/Stepniak/Integrative_Analysis/Data/5000_genes_logFC_RNA_Stepniak.csv", header = TRUE, sep = " ")
+
+H3K27ac_counts <- read.csv("../../../Glioma/Stepniak/Integrative_Analysis/Data/counts_ChIP_H3K27ac_Stepniak_norm.csv", header = TRUE, sep = " ")
+H3K27ac_loci <- read.csv("../../../Glioma/Stepniak/Integrative_Analysis/Data/5000_peaks_logFC_H3K27ac_Stepniak.csv", header = TRUE, sep = " ")
+
+H3K27me3_counts <- read.csv("../../../Glioma/Stepniak/Integrative_Analysis/Data/counts_ChIP_H3K27me3_Stepniak_norm.csv", header = TRUE, sep = " ")
+H3K27me3_loci <- read.csv("../../../Glioma/Stepniak/Integrative_Analysis/Data/5000_peaks_logFC_H3K27me3_Stepniak.csv", header = TRUE, sep = " ")
+
+H3K4me3_counts <- read.csv("../../../Glioma/Stepniak/Integrative_Analysis/Data/counts_ChIP_H3K4me3_Stepniak_norm.csv", header = TRUE, sep = " ")
+H3K4me3_loci <- read.csv("../../../Glioma/Stepniak/Integrative_Analysis/Data/5000_peaks_logFC_H3K4me3_Stepniak.csv", header = TRUE, sep = " ")
+
+# Tresholding RNAseq on 5000 genes with biggest lofFC (2500neg and 2500pos)
+rna_counts_5000 <- RNA_counts[row.names(RNA_counts) %in% RNA_genes$gene_id , ]
+#list_genes <- intersect(row.names(rna_counts_5000),RNA_genes$gene_id)
+#write.table(H3K27ac_counts_5000, "Data/H3K27ac_counts_5000.csv", row.names = TRUE )
+H3K27ac_counts_5000 <- read.csv("../../../Glioma/Stepniak/Integrative_Analysis/Data/H3K27ac_counts_5000.csv", header = TRUE, sep = " ")
+H3K27me3_counts_5000 <- H3K27me3_counts[row.names(H3K27me3_counts) %in% H3K27me3_loci$genes , ]
+H3K4me3_counts_5000 <- H3K4me3_counts[row.names(H3K4me3_counts) %in% H3K4me3_loci$genes , ]
+H3K27ac_counts_5000 <- H3K27ac_counts[row.names(H3K27ac_counts) %in% H3K27ac_loci$genes , ]
+```
+
+### Replacing gene ID by gene names in RNAseq data
+```{r, message=FALSE}
+library(ChIPpeakAnno)
+library(EnsDb.Hsapiens.v86)
+library(org.Hs.eg.db)
+library(biomaRt)
+library(dplyr)
+
+####### RNAseq dataset ###########################################################################################
+# Associating ID and interavls to gene names
+indices <- match(rownames(rna_counts_5000), RNA_genes$gene_id)
+
+# Add a new column of the gene names with the matching gene id 
+rna_counts_5000$gene_name <- RNA_genes$gene_name[indices]
+
+# Reorganising the columns order
+rna_counts_5000 <- rna_counts_5000[, c("gene_name", "DA01", "DA05", "DA06", "DA02", "DA03", "DA04")]
+
+rna_counts_5000$gene_name <- ifelse(is.na(rna_counts_5000$gene_name), rownames(rna_counts_5000), rna_counts_5000$gene_name)
+
+rna_counts_5000$gene_name <- make.names(rna_counts_5000$gene_name, unique = TRUE)
+rna_counts_5000$block <- "RNAseq"
+rna_counts_5000$gene_name<- paste(rna_counts_5000$gene_name, rna_counts_5000$block, sep = "__")
+row.names(rna_counts_5000) <- rna_counts_5000$gene_name
+rna_counts_5000 <- rna_counts_5000[,c(2:7)] 
+```
+### Replacing intervals number by gene names in ChIPseq datasets H3K4me3
+To perform this, the same method as in the ChIPseq analysis was performed with the ChIPpeakAnno package. After, the new object has to be built to be compatible with the function that builds the model. This was done also for the 2 other Histon marks H3K27me3 and H3K27ac. 
+```{r,message=FALSE}
+####### H3K4me3 dataset ###########################################################################################
+
+h3k4me3_raw_counts <- read.delim(file = "../../../Glioma/Stepniak/ChiPseq/Count_matrix/H3K4me3.consensus_peaks.featureCounts.txt", header = TRUE, sep = "\t")
+
+h3k4me3_raw_counts_info <- h3k4me3_raw_counts[,c(1,2,3,4,5)]
+h3k4me3_raw_counts_info <- h3k4me3_raw_counts_info[h3k4me3_raw_counts_info$Geneid %in% H3K4me3_loci$genes,]
+
+gr_h3k4me3 <- GRanges(
+    seqnames = Rle(h3k4me3_raw_counts_info$Chr),
+    ranges = IRanges(start = h3k4me3_raw_counts_info$Start, end = h3k4me3_raw_counts_info$End),
+    strand = Rle(strand(h3k4me3_raw_counts_info$Strand)))
+
+mcols(gr_h3k4me3) <- h3k4me3_raw_counts_info$Geneid
+
+ensembl_hs86_transcript <- transcripts(EnsDb.Hsapiens.v86)
+
+h3k4me3_macs_peaks <- annotatePeakInBatch(gr_h3k4me3, 
+                                         AnnotationData = ensembl_hs86_transcript)
+
+mart <- useMart(biomart = "ENSEMBL_MART_ENSEMBL",
+                dataset = "hsapiens_gene_ensembl")
+
+macs_peak_ensembl_h3k4me3 <- addGeneIDs(annotatedPeak = h3k4me3_macs_peaks, 
+                                mart = mart,
+                                feature_id_type = "ensembl_transcript_id",
+                                IDs2Add = "hgnc_symbol")
+
+macs_peak_ensembl_h3k4me3 <- as.data.frame(macs_peak_ensembl_h3k4me3)
+# Group by peak ID and select the first gene name
+peak_annotation_single_gene_h3K4me3 <- distinct(macs_peak_ensembl_h3k4me3, macs_peak_ensembl_h3k4me3$X, macs_peak_ensembl_h3k4me3$hgnc_symbol)
+row.names(peak_annotation_single_gene_h3K4me3) <- NULL
+peak_annotation_single_gene_h3K4me3 <- as.data.frame(peak_annotation_single_gene_h3K4me3)
+
+# Replacing missing value by NA
+peak_annotation_single_gene_h3K4me3[peak_annotation_single_gene_h3K4me3 == ""] <- NA
+# Replacing NA by interval number
+peak_annotation_single_gene_h3K4me3$`macs_peak_ensembl_h3k4me3$hgnc_symbol` <- ifelse(is.na(peak_annotation_single_gene_h3K4me3$`macs_peak_ensembl_h3k4me3$hgnc_symbol`), peak_annotation_single_gene_h3K4me3$`macs_peak_ensembl_h3k4me3$X`, peak_annotation_single_gene_h3K4me3$`macs_peak_ensembl_h3k4me3$hgnc_symbol`)
+
+peak_annotation_single_gene_h3K4me3 <- distinct(peak_annotation_single_gene_h3K4me3, peak_annotation_single_gene_h3K4me3$`macs_peak_ensembl_h3k4me3$X`, .keep_all = TRUE)
+
+peak_annotation_single_gene_h3K4me3 <- peak_annotation_single_gene_h3K4me3 %>%
+  distinct(peak_annotation_single_gene_h3K4me3$`macs_peak_ensembl_h3k4me3$X`, .keep_all = TRUE)
+
+peak_annotation_single_gene_h3K4me3 <- peak_annotation_single_gene_h3K4me3[,c(1,2)]
+
+# Matching with the first dataset
+indices_h3k4me3 <- match(rownames(H3K4me3_counts_5000), peak_annotation_single_gene_h3K4me3$`macs_peak_ensembl_h3k4me3$X`)
+H3K4me3_counts_5000$gene_name <- peak_annotation_single_gene_h3K4me3$`macs_peak_ensembl_h3k4me3$hgnc_symbol`[indices_h3k4me3]
+
+# Reorganising the columns order
+#H3K4me3_counts_5000 <- H3K4me3_counts_5000[, c("gene_name", "DA01", "DA05", "DA06", "DA02", "DA03", "DA04")]
+
+merge_columns <- function(col1, col2) {
+  merged_col <- ifelse(col1 == col2, col1, paste(col1, col2, sep = "__"))
+  return(merged_col)
+}
+
+# Apply the function to the columns
+H3K4me3_counts_5000$name <- merge_columns(H3K4me3_counts_5000$gene_name,row.names(H3K4me3_counts_5000))
+H3K4me3_counts_5000 <- H3K4me3_counts_5000[, c("gene_name","name", "DA01", "DA05", "DA06", "DA02", "DA03", "DA04")]
+
+H3K4me3_counts_5000$block <- "H3K4me3"
+H3K4me3_counts_5000$name<- paste(H3K4me3_counts_5000$name, H3K4me3_counts_5000$block, sep = "__")
+
+row.names(H3K4me3_counts_5000) <- H3K4me3_counts_5000$name
+H3K4me3_counts_5000 <- H3K4me3_counts_5000[,c(3:8)]
+###################################################################################################################################################
+```
+### Replacing intervals number by gene names in ChIPseq datasets H3K27me3
+```{r, message=FALSE}
+h3k27me3_raw_counts <- read.delim(file = "../../../Glioma/Stepniak/ChiPseq/Count_matrix/H3K27me3.consensus_peaks.featureCounts.txt", header = TRUE, sep = "\t")
+
+h3k27me3_raw_counts_info <- h3k27me3_raw_counts[,c(1,2,3,4,5)]
+h3k27me3_raw_counts_info <- h3k27me3_raw_counts_info[h3k27me3_raw_counts_info$Geneid %in% H3K27me3_loci$genes,]
+
+gr_h3k27me3 <- GRanges(
+    seqnames = Rle(h3k27me3_raw_counts_info$Chr),
+    ranges = IRanges(start = h3k27me3_raw_counts_info$Start, end = h3k27me3_raw_counts_info$End),
+    strand = Rle(strand(h3k27me3_raw_counts_info$Strand)))
+
+mcols(gr_h3k27me3) <- h3k27me3_raw_counts_info$Geneid
+
+ensembl_hs86_transcript <- transcripts(EnsDb.Hsapiens.v86)
+
+h3k27me3_macs_peaks <- annotatePeakInBatch(gr_h3k27me3, 
+                                         AnnotationData = ensembl_hs86_transcript)
+
+mart <- useMart(biomart = "ENSEMBL_MART_ENSEMBL",
+                dataset = "hsapiens_gene_ensembl")
+
+macs_peak_ensembl_h3k27me3 <- addGeneIDs(annotatedPeak = h3k27me3_macs_peaks, 
+                                mart = mart,
+                                feature_id_type = "ensembl_transcript_id",
+                                IDs2Add = "hgnc_symbol")
+
+macs_peak_ensembl_h3k27me3 <- as.data.frame(macs_peak_ensembl_h3k27me3)
+# Group by peak ID and select the first gene name
+peak_annotation_single_gene_h3K27me3 <- distinct(macs_peak_ensembl_h3k27me3, macs_peak_ensembl_h3k27me3$X, macs_peak_ensembl_h3k27me3$hgnc_symbol)
+row.names(peak_annotation_single_gene_h3K27me3) <- NULL
+peak_annotation_single_gene_h3K27me3 <- as.data.frame(peak_annotation_single_gene_h3K27me3)
+
+# Replacing missing value by NA
+peak_annotation_single_gene_h3K27me3[peak_annotation_single_gene_h3K27me3 == ""] <- NA
+# Replacing NA by interval number
+peak_annotation_single_gene_h3K27me3$`macs_peak_ensembl_h3k27me3$hgnc_symbol` <- ifelse(is.na(peak_annotation_single_gene_h3K27me3$`macs_peak_ensembl_h3k27me3$hgnc_symbol`), peak_annotation_single_gene_h3K27me3$`macs_peak_ensembl_h3k27me3$X`, peak_annotation_single_gene_h3K27me3$`macs_peak_ensembl_h3k27me3$hgnc_symbol`)
+
+peak_annotation_single_gene_h3K27me3 <- distinct(peak_annotation_single_gene_h3K27me3, peak_annotation_single_gene_h3K27me3$`macs_peak_ensembl_h3k27me3$X`, .keep_all = TRUE)
+
+peak_annotation_single_gene_h3K27me3 <- peak_annotation_single_gene_h3K27me3 %>%
+  distinct(peak_annotation_single_gene_h3K27me3$`macs_peak_ensembl_h3k27me3$X`, .keep_all = TRUE)
+
+peak_annotation_single_gene_h3K27me3 <- peak_annotation_single_gene_h3K27me3[,c(1,2)]
+
+# Matching with the first dataset
+indices_h3k27me3 <- match(rownames(H3K27me3_counts_5000), peak_annotation_single_gene_h3K27me3$`macs_peak_ensembl_h3k27me3$X`)
+H3K27me3_counts_5000$gene_name <- peak_annotation_single_gene_h3K27me3$`macs_peak_ensembl_h3k27me3$hgnc_symbol`[indices_h3k27me3]
+
+# Reorganising the columns order
+H3K27me3_counts_5000 <- H3K27me3_counts_5000[, c("gene_name", "DA01", "DA05", "DA06", "DA02", "DA03", "DA04")]
+# Apply the function to the columns
+H3K27me3_counts_5000$name <- merge_columns(H3K27me3_counts_5000$gene_name,row.names(H3K27me3_counts_5000))
+H3K27me3_counts_5000 <- H3K27me3_counts_5000[, c("gene_name","name", "DA01", "DA05", "DA06", "DA02", "DA03", "DA04")]
+
+H3K27me3_counts_5000$block <- "H3K27me3"
+H3K27me3_counts_5000$name<- paste(H3K27me3_counts_5000$name, H3K27me3_counts_5000$block, sep = "__")
+
+row.names(H3K27me3_counts_5000) <- H3K27me3_counts_5000$name
+H3K27me3_counts_5000 <- H3K27me3_counts_5000[,c(3:8)]
+
+###################################################################################################################################################
+
+```
+### Replacing intervals number by gene names in ChIPseq datasets H3K27ac
+```{r, message = FALSE}
+h3k27ac_raw_counts <- read.delim(file = "../../../Glioma/Stepniak/ChiPseq/Count_matrix/H3K27ac.consensus_peaks.featureCounts.txt", header = TRUE, sep = "\t")
+
+#h3k27ac_raw_counts <- read.csv("Data/H3K27ac_counts_5000.csv", header = TRUE, sep = " ")
+h3k27ac_raw_counts_info <- h3k27ac_raw_counts[,c(1,2,3,4,5)]
+h3k27ac_raw_counts_info <- h3k27ac_raw_counts_info[h3k27ac_raw_counts_info$Geneid %in% H3K27ac_loci$genes,]
+
+gr_h3k27ac <- GRanges(
+    seqnames = Rle(h3k27ac_raw_counts_info$Chr),
+    ranges = IRanges(start = h3k27ac_raw_counts_info$Start, end = h3k27ac_raw_counts_info$End),
+    strand = Rle(strand(h3k27ac_raw_counts_info$Strand)))
+
+mcols(gr_h3k27ac) <- h3k27ac_raw_counts_info$Geneid
+
+ensembl_hs86_transcript <- transcripts(EnsDb.Hsapiens.v86)
+
+h3k27ac_macs_peaks <- annotatePeakInBatch(gr_h3k27ac, 
+                                         AnnotationData = ensembl_hs86_transcript)
+
+mart <- useMart(biomart = "ENSEMBL_MART_ENSEMBL",
+                dataset = "hsapiens_gene_ensembl")
+
+macs_peak_ensembl_h3k27ac <- addGeneIDs(annotatedPeak = h3k27ac_macs_peaks, 
+                                mart = mart,
+                                feature_id_type = "ensembl_transcript_id",
+                                IDs2Add = "hgnc_symbol")
+
+macs_peak_ensembl_h3k27ac <- as.data.frame(macs_peak_ensembl_h3k27ac)
+# Group by peak ID and select the first gene name
+peak_annotation_single_gene_h3K27ac <- distinct(macs_peak_ensembl_h3k27ac, macs_peak_ensembl_h3k27ac$X, macs_peak_ensembl_h3k27ac$hgnc_symbol)
+row.names(peak_annotation_single_gene_h3K27ac) <- NULL
+peak_annotation_single_gene_h3K27ac <- as.data.frame(peak_annotation_single_gene_h3K27ac)
+
+# Replacing missing value by NA
+peak_annotation_single_gene_h3K27ac[peak_annotation_single_gene_h3K27ac == ""] <- NA
+# Replacing NA by interval number
+peak_annotation_single_gene_h3K27ac$`macs_peak_ensembl_h3k27ac$hgnc_symbol` <- ifelse(is.na(peak_annotation_single_gene_h3K27ac$`macs_peak_ensembl_h3k27ac$hgnc_symbol`), peak_annotation_single_gene_h3K27ac$`macs_peak_ensembl_h3k27ac$X`, peak_annotation_single_gene_h3K27ac$`macs_peak_ensembl_h3k27ac$hgnc_symbol`)
+
+peak_annotation_single_gene_h3K27ac <- distinct(peak_annotation_single_gene_h3K27ac, peak_annotation_single_gene_h3K27ac$`macs_peak_ensembl_h3k27ac$X`, .keep_all = TRUE)
+
+peak_annotation_single_gene_h3K27ac <- peak_annotation_single_gene_h3K27ac %>%
+  distinct(peak_annotation_single_gene_h3K27ac$`macs_peak_ensembl_h3k27ac$X`, .keep_all = TRUE)
+
+peak_annotation_single_gene_h3K27ac <- peak_annotation_single_gene_h3K27ac[,c(1,2)]
+
+# Matching with the first dataset
+indices_h3k27ac <- match(rownames(H3K27ac_counts_5000), peak_annotation_single_gene_h3K27ac$`macs_peak_ensembl_h3k27ac$X`)
+H3K27ac_counts_5000$gene_name <- peak_annotation_single_gene_h3K27ac$`macs_peak_ensembl_h3k27ac$hgnc_symbol`[indices_h3k27ac]
+
+# Reorganising the columns order
+H3K27ac_counts_5000 <- H3K27ac_counts_5000[, c("gene_name", "DA01_H3K27ac", "DA05_M_H3K27ac", "DA06_H3K27ac", "DA02_H3K27ac", "DA03_H3K27ac", "DA04_H3K27ac")]
+
+colnames(H3K27ac_counts_5000) <- c("gene_name", "DA01", "DA05", "DA06", "DA02", "DA03", "DA04")
+# Apply the function to the columns
+H3K27ac_counts_5000$name <- merge_columns(H3K27ac_counts_5000$gene_name,row.names(H3K27ac_counts_5000))
+H3K27ac_counts_5000 <- H3K27ac_counts_5000[, c("gene_name","name", "DA01", "DA05", "DA06", "DA02", "DA03", "DA04")]
+
+H3K27ac_counts_5000$block <- "H3K27ac"
+H3K27ac_counts_5000$name<- paste(H3K27ac_counts_5000$name, H3K27ac_counts_5000$block, sep = "__")
+
+row.names(H3K27ac_counts_5000) <- H3K27ac_counts_5000$name
+H3K27ac_counts_5000 <- H3K27ac_counts_5000[,c(3:8)]
+###################################################################################################################################################
+
+```
+### Transposition of the previous dataset to build the input for the next analysis
+```{r, message=FALSE}
+# Transpose the objects
+rna_counts_5000 <- as.data.frame(t(rna_counts_5000))
+H3K27ac_counts_5000 <- as.data.frame(t(H3K27ac_counts_5000))
+H3K27me3_counts_5000 <- as.data.frame(t(H3K27me3_counts_5000))
+H3K4me3_counts_5000 <- as.data.frame(t(H3K4me3_counts_5000))
+```
+### Creation of the objects for further analysis
+```{r, message = FALSE}
+
+Y <- read.csv("pdata_DA_complete.csv", sep =";")
+Y <- Y$Group
+Y <- as.factor(Y)
+
+
+data1 = list(RNAseq = rna_counts_5000, 
+            H3K4me3 = H3K4me3_counts_5000,
+            H3K27me3 = H3K27me3_counts_5000,
+            H3K27ac = H3K27ac_counts_5000)
+
+data = list(RNAseq = data1$RNAseq,
+            H3K4me3 = data1$H3K4me3,
+            H3K27me3 = data1$H3K27me3,
+            H3K27ac = data1$H3K27ac)
+
+```
+### Partial Least Squares
+This is not the most important setp, it was to vizualize the correlation of each dataset 2 by 2
+```{r, message = FALSE}
+list.keepX = c(6, 6) # select arbitrary values of features to keep
+list.keepY = c(6, 6)
+
+pls1 <- spls(data[["RNAseq"]], data[["H3K4me3"]], 
+             keepX = list.keepX, keepY = list.keepY) 
+pls2 <- spls(data[["RNAseq"]], data[["H3K27ac"]], 
+             keepX = list.keepX, keepY = list.keepY) 
+pls3 <- spls(data[["RNAseq"]], data[["H3K27me3"]], 
+             keepX = list.keepX, keepY = list.keepY) 
+pls4 <- spls(data[["H3K4me3"]], data[["H3K27me3"]], 
+             keepX = list.keepX, keepY = list.keepY) 
+pls5 <- spls(data[["H3K4me3"]], data[["H3K27ac"]], 
+             keepX = list.keepX, keepY = list.keepY) 
+pls6 <- spls(data[["H3K27ac"]], data[["H3K27me3"]], 
+             keepX = list.keepX, keepY = list.keepY) 
+
+#explained_variance_pls1 <- pls1$prop_expl_var
+plotVar(pls1, cutoff = 0, title = "(a) RNAseq vs H3K4me3", 
+        legend = c("RNAseq", "H3K4me3"), 
+        var.names = FALSE, style = 'graphics', 
+        pch = c(16, 17), cex = c(2,2), 
+        col = c('darkorchid', 'lightgreen'))
+
+
+plotVar(pls2, cutoff = 0, title = "(a) RNAseq vs H3K27ac", 
+        legend = c("RNAseq", "H3K27ac"), 
+        var.names = FALSE, style = 'graphics', 
+        pch = c(16, 17), cex = c(2,2), 
+        col = c('darkorchid', 'lightgreen'))
+
+plotVar(pls3, cutoff = 0, title = "(a) RNAseq vs H3K27me3", 
+        legend = c("RNAseq", "H3K27me3"), 
+        var.names = FALSE, style = 'graphics', 
+        pch = c(16, 17), cex = c(2,2), 
+        col = c('darkorchid', 'lightgreen'))
+
+
+plotVar(pls4, cutoff = 0, title = "(a) H3K4me3 vs H3K27me3", 
+        legend = c("H3K4me3", "H3K27me3"), 
+        var.names = FALSE, style = 'graphics', 
+        pch = c(16, 17), cex = c(2,2), 
+        col = c('darkorchid', 'lightgreen'))
+
+plotVar(pls5, cutoff = 0, title = "(a) H3K4me3 vs H3K27ac", 
+        legend = c("H3K4me3", "H3K27ac"), 
+        var.names = FALSE, style = 'graphics', 
+        pch = c(16, 17), cex = c(2,2), 
+        col = c('darkorchid', 'lightgreen'))
+
+
+plotVar(pls6, cutoff = 0, title = "(a) H3K27ac vs H3K27me3", 
+        legend = c("H3K27ac", "H3K27me3"), 
+        var.names = FALSE, style = 'graphics', 
+        pch = c(16, 17), cex = c(2,2), 
+        col = c('darkorchid', 'lightgreen'))
+
+
+```
+### Extracting correlation scores between block 2 by 2
+```{r, message = FALSE}
+cor1 <- cor(pls1$variates$X, pls1$variates$Y)
+cor2 <- cor(pls2$variates$X, pls2$variates$Y)
+cor3 <- cor(pls3$variates$X, pls3$variates$Y)
+cor4 <- cor(pls4$variates$X, pls4$variates$Y)
+cor5 <- cor(pls5$variates$X, pls5$variates$Y)
+cor6 <- cor(pls6$variates$X, pls6$variates$Y)
+```
+### Construction of the design matrix and the keepX object that allows the selection of the number of features to keep for each block and each component
+```{r, message = FALSE}
+# for square matrix filled with 0.1s
+design <- matrix(0.1, ncol = length(data), nrow = length(data), 
+                dimnames = list(names(data), names(data)))
+diag(design) <- 0 # set diagonal to 0s
+design
+
+########### Construction of the keepX object
+
+keep_X_1 <- list(
+  RNAseq = c(1000, 1000),
+  H3K4me3 = c(1000, 1000),
+  H3K27me3 = c(1000, 1000),
+  H3K27ac = c(1000, 1000)
+)
+
+keep_X_2 <- list(
+  RNAseq = c(100, 100),
+  H3K4me3 = c(100, 100),
+  H3K27me3 = c(100, 100),
+  H3K27ac = c(100, 100)
+)
+
+keep_X_3 <- list(
+  RNAseq = c(50, 50),
+  H3K4me3 = c(50, 50),
+  H3K27me3 = c(50, 50),
+  H3K27ac = c(50, 50)
+)
+```
+### FINAL MODEL
+We build the final model and extract the number of features of interest. The keep_X object can be chosen amongst the ones built previously or can be newly build. 
+We then extracted the gene of interest and compared it to metabolism.
+See figure_integrative_analysis.R to have the lists of genes and intervals.
+```{r, message=FALSE}
+#var <- selectVar(basic_diablo_model, comp = 1, block = 1)
+final.diablo.model = block.splsda(X = data, Y = Y, ncomp = 2, design = design, keepX = keep_X_2)
+
+rna_50_var <- selectVar(final.diablo.model, block = 'RNAseq', comp = 1)$RNAseq$name
+h3k4me3_50_var <- selectVar(final.diablo.model, block = 'H3K4me3', comp = 1)$H3K4me3$name
+h3k27me3_50_var <- selectVar(final.diablo.model, block = 'H3K27me3', comp = 1)$H3K27me3$name
+h3k27ac_50_var <- selectVar(final.diablo.model, block = 'H3K27ac', comp = 1)$H3K27ac$name
+
+genes_50_each <- c(rna_50_var, h3k4me3_50_var, h3k27me3_50_var, h3k27ac_50_var)
+genes_50_each <- sub("__.*", "", genes_50_each)
+
+metabo_genes_all <- read.table("../Differential_Analysis/Lists_genes/all_metabo.tsv", header = TRUE, sep = "\t")
+metabo_genes <- metabo_genes_all$Gene_name
+
+metabo <- intersect(metabo_genes,genes_50_each)
+
+```
+### PLOTS to vizualize the results
+```{r, message=FALSE}
+plotDiablo(final.diablo.model, ncomp = 1)
+```
+## Plot of individuals
+```{r, message=FALSE}
+plotIndiv(final.diablo.model, ind.names = TRUE, legend = TRUE, 
+          title = 'DIABLO Sample Plots',
+          col.per.group = c("#D60000", "#4294D8"),
+          legend.title = "Groups",
+          pch = 16)
+```
+## Arrow plot
+```{r, message=FALSE}
+plotArrow(final.diablo.model, ind.names = FALSE, legend = TRUE, 
+          title = 'DIABLO',
+          col.per.group = c("#D60000", "#4294D8"))
+```
+## Correlation circle plot
+```{r, message=FALSE}
+plotVar(final.diablo.model, var.names = FALSE, 
+        style = 'graphics', legend = TRUE,
+        pch = c(16, 17, 15,18), cex = c(2,2,2,2), 
+        col = c('darkorchid', 'brown1', 'lightgreen','skyblue'))
+```
+## Correlation plot
+```{r, message=FALSE}
+
+circos_plot <- circosPlot(final.diablo.model, cutoff = 0.975, line = TRUE,
+           color.blocks= c('darkorchid', 'brown1', 'lightgreen', 'skyblue'),
+           color.cor = c("chocolate3","grey20"), size.labels = 1.5, comp =1,
+           color.Y = c("#D60000", "#4294D8"))
+
+# Open a PDF device
+#pdf("circos_plot.pdf", width = 7, height = 5)  # Adjust dimensions as needed
+
+# Call the plot function
+circosPlot(final.diablo.model, cutoff = 0.975, line = TRUE,
+           color.blocks= c('darkorchid', 'brown1', 'lightgreen', 'skyblue'),
+           color.cor = c("chocolate3","grey20"), size.labels = 1.5, comp =1,
+           color.Y = c("#D60000", "#4294D8")) # This function should contain plot commands
+
+
+```
+## Network 
+```{r, message=FALSE}
+network(final.diablo.model, blocks = c(1,2,3,4),
+        color.node = c('darkorchid', 'brown1', 'lightgreen', 'skyblue'), cutoff = 0.95
+        #,
+        #save = "pdf",
+        #name.save = "network"
+        )
+```
+## Clustered Image Map
+Go in figure_integrative_analysis to perform it 
+```{r, message=FALSE}
+#sim <- cimDiablo(final.diablo.model, comp = 1)
+
+```
+
+

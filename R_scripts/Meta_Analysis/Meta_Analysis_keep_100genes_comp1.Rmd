@@ -1,0 +1,698 @@
+---
+title: "Meta_analysis_keep_100genes_comp1"
+output: html_document
+date: "2024-06-13"
+author: "LANON Alizée"
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  warning = FALSE,     # Suppress warnings from R code
+  message = FALSE     
+)
+```
+### Process of the data
+The raw data were processed using nf-core v2.14.1 rnaseq v3.11.0 pipeline on the IFB cluster with the following command line:
+"
+sbatch -A gliomep53 --wrap="\
+nextflow run nf-core/rnaseq -r 3.11.0 -profile ifb_core -resume -c ./Glioma/Stepniak/RNAseq/custom_module.config \
+       --input ./Glioma/Stepniak/RNAseq/samplesheet_RNA_glioma.csv \
+       --outdir ./Glioma/Stepniak/RNAseq/nextflow/ \
+       --fasta ./Glioma/save/RESSOURCES/REFERENCES/GRCh38/Homo_sapiens.GRCh38.dna_sm.primary_assembly.fa \
+       --gtf ./Glioma/save/RESSOURCES/REFERENCES/GRCh38/Homo_sapiens.GRCh38.108.gtf \
+       --star_index ./Glioma/save/RESSOURCES/REFERENCES/GRCh38/STAR/ \
+       --salmon_index ./Glioma/save/RESSOURCES/REFERENCES/GRCh38/salmon/"
+"
+### DOWNLOAD DATASETS
+```{r, message=FALSE}
+#############################################################################################
+#### STEPNIAK
+data_stepniak <- read.table("../../../Glioma/Stepniak/RNAseq/nextflow/star_salmon/salmon.merged.gene_counts.tsv", header = TRUE)
+pdata_stepniak <- read.csv("pdata/pdata_DA_complete.csv", sep =";", header = TRUE)
+row.names(pdata_stepniak) <- pdata_stepniak$Sample
+#--> Count matrix
+mrna_raw_counts_stepniak <- data_stepniak
+row.names(mrna_raw_counts_stepniak) <- mrna_raw_counts_stepniak$gene_id
+mrna_raw_counts_stepniak <- mrna_raw_counts_stepniak[,-c(1:2)]
+mrna_raw_counts_stepniak <- mrna_raw_counts_stepniak[,c(1,4,3,6,5,7)]
+#--> Order and match
+mrna_raw_counts_stepniak <- mrna_raw_counts_stepniak[,match(pdata_stepniak$Sample, colnames(mrna_raw_counts_stepniak), nomatch = 0)]
+pdata_stepniak <- pdata_stepniak[pdata_stepniak$Sample %in% colnames(mrna_raw_counts_stepniak),]
+#############################################################################################
+#### JIGNA
+data_jigna <- read.table("../../../Glioma/Hugnot/data/salmon.merged.gene_counts_Jigna.tsv", header = TRUE)
+pdata_jigna <- read.csv("pdata/pdata_Jigna.csv", sep =";", header = TRUE)
+row.names(pdata_jigna) <- pdata_jigna$Sample
+#--> Count matrix
+mrna_raw_counts_jigna <- data_jigna
+row.names(mrna_raw_counts_jigna) <- mrna_raw_counts_jigna$gene_id
+mrna_raw_counts_jigna <- mrna_raw_counts_jigna[,-c(1:2)]
+mrna_raw_counts_jigna <- mrna_raw_counts_jigna[,c(1,3,5,7,9,11,13,15)]
+#--> Order and match
+mrna_raw_counts_jigna <- mrna_raw_counts_jigna[,match(pdata_jigna$Sample, colnames(mrna_raw_counts_jigna), nomatch = 0)]
+pdata_jigna <- pdata_jigna[pdata_jigna$Sample %in% colnames(mrna_raw_counts_jigna),]
+#############################################################################################
+```
+### COMBIBNE THE 2 DATAFRAMES AND FILTERING
+In this step, we combine the 2 dataframes in order to filter them on the same set of genes and to avoid losing information if we filtered them independently. It was decided to do so after trying to filter them independently and seeing that some genes were filtered out into one dataset but those genes were of interest in the other resulting into a loss of information.
+```{r, message=FALSE}
+library(HTSFilter)
+common_lines <- intersect(rownames(mrna_raw_counts_jigna), rownames(mrna_raw_counts_stepniak))
+
+mrna_raw_counts_jigna_common <- mrna_raw_counts_jigna[common_lines,]
+mrna_raw_counts_stepniak_common <- mrna_raw_counts_stepniak[common_lines,]
+combined_count_mrna <- cbind(mrna_raw_counts_jigna_common,mrna_raw_counts_stepniak_common)
+
+Y_pdata <- read.csv("pdata/pdata.csv", sep =";", header = TRUE)
+
+mrna_filter_common <- HTSFilter(round(combined_count_mrna),
+                         Y_pdata$Group,
+                         s.min=1, s.max=200)
+
+mrna_filter_common <- mrna_filter_common$filteredData
+```
+### SEPARATION AFTER FILTERING TO NORMALIZE INDEPENDENTLY
+After filtering to keep the same set of genes of interest for further analysis, we have to reseparate the datasets in order to perform a normalization. This normalization has to be performed independently for both because each dataset were sequenced independently resulting in different normalization factor in each.
+```{r, message=FALSE}
+mrna_filter_stepniak <- mrna_filter_common[,9:14]
+mrna_filter_jigna <- mrna_filter_common[,1:8]
+```
+### STEPNIAK DATA NORMALIZATION
+We then normalize each dataset independtly using the exact same method used in the differential analysis performed on RNAseq data. (see Differential Analysis files for explanation)
+```{r, message=FALSE}
+library(mixOmics)
+
+#--> Feature annotation
+mrna_gene_stepniak <- read.table("../../../Glioma/Stepniak/RNAseq/nextflow/star_salmon/salmon.merged.gene_counts.tsv", header = TRUE)[,c(1:2)]
+
+## Normalisation
+library(RUVSeq)
+library(reshape)
+library(EDASeq)
+
+#--> edgeR TMM normalization
+library(edgeR)
+
+tmm_set_stepniak <-  mrna_filter_stepniak
+
+pdata_tmm_stepniak <- pdata_stepniak
+design <- cbind(model.matrix(~ 0 + pdata_tmm_stepniak$Group))
+colnames(design) <- gsub(".*\\$|)", "", colnames(design))
+
+tmm_set_stepniak <- DGEList(counts = tmm_set_stepniak,
+                   genes = mrna_gene_stepniak[match(
+                     row.names(mrna_filter_stepniak), 
+                     mrna_gene_stepniak$gene_id),],
+                   group = pdata_tmm_stepniak$Group)
+
+tmm_set_stepniak <- calcNormFactors(tmm_set_stepniak)
+
+#--> Estimate dispersion and fit the model
+tmm_set_stepniak <- estimateGLMRobustDisp(tmm_set_stepniak, design)
+
+##### Count per million
+tmm_cpm_stepniak <- cpm(tmm_set_stepniak, normalized.lib.sizes = TRUE, log = TRUE)
+
+# --> Transpose the df to have the sample in lines
+t_mrna_norm_stepniak <- as.data.frame(t(tmm_cpm_stepniak))
+
+```
+### JIGNA DATA NORMALIZATION
+```{r, message=FALSE}
+#--> Feature annotation
+mrna_gene_jigna <- read.table("../../../Glioma/Hugnot/data/salmon.merged.gene_counts_Jigna.tsv", header = TRUE)[,c(1:2)]
+
+###### Normalization ######
+library(RUVSeq)
+library(reshape)
+library(EDASeq)
+
+#--> edgeR TMM normalization
+library(edgeR)
+
+tmm_set_jigna <-  mrna_filter_jigna
+
+pdata_tmm_jigna <- pdata_jigna
+design <- cbind(model.matrix(~ 0 + pdata_tmm_jigna$Group))
+colnames(design) <- gsub(".*\\$|)", "", colnames(design))
+
+tmm_set_jigna <- DGEList(counts = tmm_set_jigna,
+                   genes = mrna_gene_jigna[match(
+                     row.names(mrna_filter_jigna), 
+                     mrna_gene_jigna$gene_id),],
+                   group = pdata_tmm_jigna$Group)
+
+tmm_set_jigna <- calcNormFactors(tmm_set_jigna)
+
+#--> Estimate dispersion and fit the model
+tmm_set_jigna <- estimateGLMRobustDisp(tmm_set_jigna, design)
+
+##### Count per million
+tmm_cpm_jigna <- cpm(tmm_set_jigna, normalized.lib.sizes = TRUE, log = TRUE)
+
+# --> Transpose the df to have the sample in lines
+t_mrna_norm_jigna <- as.data.frame(t(tmm_cpm_jigna))
+```
+### RECOMBINE THE 2 DATAFRAME AFTER NORMALIZATION
+We then recombine the dataset filtered and normalized to perform the meta analysis
+```{r, message=FALSE}
+X_combined_count_mrna <- rbind(t_mrna_norm_jigna,t_mrna_norm_stepniak)
+Y_pdata <- read.csv("pdata/pdata.csv", sep =";", header = TRUE)
+
+class <- as.factor(Y_pdata$Group)
+study <- factor(Y_pdata$Study)
+```
+### COMPARISON WITH PREVIOUS ANALYSIS
+This step is just to compare the set of genes remaining with previous one to ensure that no information was lost in the process
+```{r, message=FALSE}
+library(ggvenn)
+genes_Jigna_downreg <- read.csv("../Differential_Analysis/Differential_Analysis_Jigna/lists_genes_up_down_jigna_data/downregulated_genes_Jigna_samples.csv", header = TRUE)
+genes_Jigna_upreg <- read.csv("../Differential_Analysis/Differential_Analysis_Jigna/lists_genes_up_down_jigna_data/upregulated_genes_Jigna_samples.csv", header = TRUE)
+#genes_Jigna_downreg_metabo <- read.csv("../Differential_Analysis/Differential_analysis_Jigna/downregulated_metabo_genes_Jigna_samples.csv", header = FALSE)
+#genes_Jigna_upreg_metabbo <- read.csv("../Differential_Analysis/Differential_analysis_Jigna/upregulated_metabo_genes_Jigna_samples.csv", header = FALSE)
+
+genes_Stepniak_downreg <- read.csv("../Differential_Analysis/Differential_Analysis_Stepniak/RNA/lists_dysreg_genes_stepniak/downregulated_genes_DA.csv", header = TRUE)
+genes_Stepniak_upreg <- read.csv("../Differential_Analysis/Differential_Analysis_Stepniak/RNA/lists_dysreg_genes_stepniak/upregulated_genes_DA.csv", header = TRUE)
+#genes_Stepniak_upreg_metabo <- read.csv("../Differential_Analysis/Differential_Analysis_Stepniak/RNA/upregulated_metabo_genes_DA.csv", header = TRUE)
+#genes_Stepniak_downreg_metabo <- read.csv("../Differential_Analysis/Differential_Analysis_Stepniak/RNA/downregulated_metabo_genes_DA.csv", header = TRUE)
+
+gene_names <- mrna_gene_stepniak[match(
+  common_lines, 
+  mrna_gene_stepniak$gene_id),]
+
+metabo_genes_all <- read.table("../Differential_Analysis/Lists_genes/all_metabo.tsv", header = TRUE, sep = "\t")
+metabo_genes <- metabo_genes_all$Gene_name
+
+meta_analysis_genes <- gene_names$gene_name
+down_genes_Jigna <- as.character(genes_Jigna_downreg$x)
+up_genes_Jigna <- as.character(genes_Jigna_upreg$x)
+genes_jigna <- c(down_genes_Jigna,up_genes_Jigna)
+
+Jigna_genes = list(Downregulated = down_genes_Jigna, meta_analysis_genes = meta_analysis_genes, Metabo = metabo_genes, Upregulated = up_genes_Jigna)
+
+# Create the Venn diagram
+venn_plot_dysreg_jigna <- ggvenn(
+  Jigna_genes,
+)
+venn_plot_dysreg_jigna
+
+#######
+meta_analysis_genes <- gene_names$gene_name
+down_genes_Stepniak <- as.character(genes_Stepniak_downreg$x)
+up_genes_Stepniak <- as.character(genes_Stepniak_upreg$x)
+genes_stepniak <- c(down_genes_Stepniak,up_genes_Stepniak)
+
+Stepniak_genes = list(Downregulated = down_genes_Stepniak, meta_analysis_genes = meta_analysis_genes, Metabo = metabo_genes, Upregulated = up_genes_Stepniak)
+
+# Create the Venn diagram
+venn_plot_dysreg_stepniak <- ggvenn(
+  Stepniak_genes,
+)
+venn_plot_dysreg_stepniak
+
+```
+### MINT sPLS-DA Model
+This step is the meta analysis. It created a model that erases the batch effect between the 2 datasets and that choses features that seem to discriminates between the 2 conditions.
+Usually MINT is used to predict the classification of novel samples by generating a predictive model with supervised method. In my analysis, I only wanted to use their method to remove the batch effect to perform in the end a differential analysis and not to create a predictive model.
+```{r, message=FALSE}
+result <- mint.splsda(X = X_combined_count_mrna, Y = class, study = study, ncomp = 2)
+
+class_colors <- c("#D60000", "#4294D8")
+
+# Plot with custom colors
+plotIndiv(result, comp = c(1, 2), col = class_colors, legend = TRUE)
+
+## TUNING THE NUMBER OF COMPONENTS
+splsda_perf <- perf(result)
+plot(splsda_perf)
+splsda_perf$global.error
+
+optim_ncomp <- 2
+
+## TUNING THE NUMBER OF FEATURES
+splsda_tune <- tune(X = X_combined_count_mrna, 
+                    Y = class, 
+                    study = study, 
+                    ncomp = optim_ncomp,
+                    test.keepX = seq(1, 100, 1),
+                    nrepeat = 5,
+                    method = "mint.splsda",
+                    measure = "BER",
+                    dist = "centroids.dist",
+                    )
+
+plot(splsda_tune, sd = FALSE)
+
+optim_keepX <- splsda_tune$choice.keepX # extract optimal values
+
+optim_keepX <- c(100,100)
+
+## FINAL MODEL
+final_splsda_model <- mint.splsda(X = X_combined_count_mrna, 
+                                  Y = class, 
+                                  study = study, 
+                                  ncomp = optim_ncomp, 
+                                  keepX = optim_keepX)
+
+#dev.set(dev.next())
+
+#pdf("sim.pdf")
+
+class_levels <- levels(as.factor(class))
+class_colors <- c("#D60000", "#4294D8")
+names(class_colors) <- class_levels
+
+# Ensure row annotations are a factor
+class <- as.factor(class)
+
+row_colors <- class_colors[class]
+
+legend <- list(legend = names(class_colors), fill = class_colors, 
+       title = "Groups", cex = 0.8, inset = 0.02)
+
+sim <- cim(final_splsda_model, comp = 1, margins=c(10,5), 
+    row.sideColors = row_colors,
+    legend = legend,
+    row.names = FALSE, title = "MINT sPLS-DA, component 1",
+    xlab = "Genes",
+    ylab = "Samples"
+    ,save = 'pdf', 
+    name.save = "Comp1_100genes"
+    )
+
+#dev.off()
+
+selected_gene_comp1 <- selectVar(final_splsda_model, comp = 1)$name
+
+gene_names <- mrna_gene_stepniak[match(
+  selected_gene_comp1, 
+  mrna_gene_stepniak$gene_id),]
+
+cluster_1 <- sim$col.names[1:51]
+
+gene_names_cluster_1 <- mrna_gene_stepniak[match(
+  cluster_1, 
+  mrna_gene_stepniak$gene_id),]
+
+cluster_2 <- sim$col.names[52:100]
+
+gene_names_cluster_2 <- mrna_gene_stepniak[match(
+  cluster_2, 
+  mrna_gene_stepniak$gene_id),]
+
+cluster1 <- gene_names_cluster_1$gene_name
+
+cluster2 <- gene_names_cluster_2$gene_name
+
+gene_names_cluster_1$cluster <- 1
+
+gene_names_cluster_2$cluster <- 2
+
+df <- rbind(gene_names_cluster_1, gene_names_cluster_2)
+
+```
+## COMPARISON WITH METABO
+```{r, message = FALSE}
+metabo_genes_all <- read.table("../Differential_Analysis/Lists_genes/all_metabo.tsv", header = TRUE, sep = "\t")
+metabo_genes <- metabo_genes_all$Gene_name
+
+gene_metabo <- intersect(metabo_genes,gene_names$gene_name)
+#gene_metabo
+
+metabob_clust1 <- intersect(cluster1, metabo_genes)
+
+metabo_clust2 <- intersect(cluster2, metabo_genes)
+
+metabob_clust1
+metabo_clust2
+```
+### Over representation analysis KEGG metabo
+The over representation analysis are the same as presented into the Differential Analysis files.
+```{r, message = FALSE}
+#---> Split genes according to the module they belong to
+probes <- split(df$gene_name,
+                f = df$cluster)
+
+#--->  Over-representation analysis
+library(ReactomePA)
+library(clusterProfiler)
+library(stringr)
+library(stringi)
+library(data.table)
+library(scales)
+library(plotly)
+
+#--> Load annotations
+library(gage)
+library(org.Hs.eg.db)
+
+#--> Load annotations
+#gmt <- list.files("/shared/projects/gliomep53/Scripts_R/Differential_Analysis/gmt_file/", full.names = TRUE)
+
+#--> Load KEGG annotation
+kegg <- kegg.gsets(species = "hsa", id.type = "entrez")
+ 
+#--> Select KEGG metabolic pathways
+kegg.met <- kegg$kg.sets[kegg$met.idx]
+ 
+#--> Map gene gene_name to Entrez ID
+kegg.met_2 <- lapply(kegg.met, function(x) {mapIds(org.Hs.eg.db,x, 'SYMBOL', 'ENTREZID')})
+names(kegg.met_2) <- names(kegg.met)
+
+kegg.met_2 <- melt(kegg.met_2)
+kegg.met_2 <- kegg.met_2[,c(2,1)]
+colnames(kegg.met_2) <- c("term", "gene")
+
+#--> Create a formatting function for gene names
+format <- function(x) {
+  
+  b <- gregexpr("/", x)[[1]]
+  
+  if (length(b) > 10) {
+    stri_sub_all(x, from = b[seq(from = 10, to = length(b), by = 10)], length = 1) <- " \n "
+    x <- gsub("/", " ", x)
+    
+  }else{
+    x <- gsub("/", " ", x)
+  }
+  
+  return(x)
+}
+
+#--> Create a function for over-representation analysis
+or_analysis <- function(gmt) {
+  
+  #gmt <- read.gmt(gmt)
+  gmt <- gmt
+  
+  fun_enrich_res <- data.frame(compareCluster(probes,
+                                              fun='enricher',
+                                              TERM2GENE=gmt,
+                                              pvalueCutoff =1,
+                                              qvalueCutoff =1,
+                                              minGSSize = 10))
+  
+  sel <- tapply(fun_enrich_res$Description,
+                INDEX = fun_enrich_res$Cluster,
+                function(x) {y <- x[c(1:10)]
+                return(y)})
+  sel <- unlist(sel)
+  
+  fun_enrich_res_2 <- fun_enrich_res[fun_enrich_res$Description %in%sel,]
+  
+  for (i in sel) {
+    if (nrow(fun_enrich_res_2[which(fun_enrich_res_2$Description == i),]) > 1) {
+      min_p <- min(fun_enrich_res_2[which(fun_enrich_res_2$Description == i),]$pvalue)
+      fun_enrich_res_2[which(fun_enrich_res_2$pvalue > min_p &
+                               fun_enrich_res_2$Description == i),]$qvalue <- NA
+    }}
+  
+  #fun_enrich_res_2 <- fun_enrich_res[which(fun_enrich_res$p.adjust < .1),]
+  
+  #--> Format names
+  fun_enrich_res_2 <- na.omit(fun_enrich_res_2)
+  
+  #--> Order
+  fun_enrich_res_2$Description <- factor(fun_enrich_res_2$Description,
+                                         levels = unique(fun_enrich_res_2$Description))
+  
+  #--> Convert to gene ratios to percent
+  fun_enrich_res_2$Percent <- unlist(lapply(strsplit(fun_enrich_res_2$GeneRatio, "/"), function(x){as.numeric(x[1])/as.numeric(x[2])}*100))
+  
+  #--> Format gene names
+  fun_enrich_res_2$geneID <- lapply(fun_enrich_res_2$geneID, format)
+  
+  return(list(Res = fun_enrich_res_2,
+              Levels = levels(fun_enrich_res_2$Description)))
+}
+
+#--> Apply over-representation tests
+test <- lapply(list(kegg.met_2), or_analysis)
+
+#--> Format the output
+test_2 <- list(test[[1]]$Res)
+
+names(test_2) <- c("KEGG")
+
+test_2 <- rbindlist(test_2, use.names = TRUE, idcol = "Database")
+
+test_2$Description <- as.factor(test_2$Description)
+
+levels(test_2$Description) <- c(test[[1]]$Levels)
+
+test_2$Description <- gsub("KEGG_|", "", test_2$Description)
+test_2$Description <- gsub("_", " ", test_2$Description)
+test_2$Description <- str_to_sentence(test_2$Description)
+test_2$Description <- factor(test_2$Description, levels = unique(test_2$Description))
+
+#--> Plot
+p <- ggplot(test_2, aes(y = Description,
+                        x = Cluster,
+                        color = -log10(qvalue),
+                        size = Percent)) +
+  geom_point(shape = 16, stroke = .5, aes(text = gsub("/", " ", geneID))) +
+  scale_color_gradient(low = "firebrick1", high = "chartreuse3") +
+  facet_wrap(vars(Database), scales = "free_y", ncol = 1) +
+  theme() + 
+  scale_y_discrete(labels = label_wrap(70)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        axis.text.y = element_text(size = 8),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.margin = margin(10, 10, 10, 200))
+
+ggplotly(p)
+```
+### Over representation analysis KEGG
+```{r, message=FALSE}
+#---> Split genes according to the module they belong to
+probes <- split(df$gene_name,
+                f = df$cluster)
+
+#--->  Over-representation analysis
+library(ReactomePA)
+library(clusterProfiler)
+library(stringr)
+library(stringi)
+library(data.table)
+library(scales)
+
+#--> Load annotations
+gmt <- list.files("/shared/projects/gliomep53/Stage_M2/Scripts_R/Differential_Analysis/gmt_file/kegg/", full.names = TRUE)
+
+#--> Create a formatting function for gene names
+format <- function(x) {
+  
+  b <- gregexpr("/", x)[[1]]
+  
+  if (length(b) > 10) {
+    stri_sub_all(x, from = b[seq(from = 10, to = length(b), by = 10)], length = 1) <- " \n "
+    x <- gsub("/", " ", x)
+    
+  }else{
+    x <- gsub("/", " ", x)
+  }
+  
+  return(x)
+}
+
+#--> Create a function for over-representation analysis
+or_analysis <- function(gmt) {
+  
+  gmt <- read.gmt(gmt)
+  
+  fun_enrich_res <- data.frame(compareCluster(probes,
+                                              fun='enricher',
+                                              TERM2GENE=gmt,
+                                              pvalueCutoff =1,
+                                              qvalueCutoff =.2,
+                                              minGSSize = 10))
+  
+  sel <- tapply(fun_enrich_res$Description,
+                INDEX = fun_enrich_res$Cluster,
+                function(x) {y <- x[c(1:5)]
+                return(y)})
+  sel <- unlist(sel)
+  
+  fun_enrich_res_2 <- fun_enrich_res[fun_enrich_res$Description %in%sel,]
+  
+  for (i in sel) {
+    if (nrow(fun_enrich_res_2[which(fun_enrich_res_2$Description == i),]) > 1) {
+      min_p <- min(fun_enrich_res_2[which(fun_enrich_res_2$Description == i),]$pvalue)
+      fun_enrich_res_2[which(fun_enrich_res_2$pvalue > min_p &
+                               fun_enrich_res_2$Description == i),]$qvalue <- NA
+    }}
+  
+  #fun_enrich_res_2 <- fun_enrich_res[which(fun_enrich_res$p.adjust < .1),]
+  
+  #--> Format names
+  fun_enrich_res_2 <- na.omit(fun_enrich_res_2)
+  
+  #--> Order
+  fun_enrich_res_2$Description <- factor(fun_enrich_res_2$Description,
+                                         levels = unique(fun_enrich_res_2$Description))
+  
+  #--> Convert to gene ratios to percent
+  fun_enrich_res_2$Percent <- unlist(lapply(strsplit(fun_enrich_res_2$GeneRatio, "/"), function(x){as.numeric(x[1])/as.numeric(x[2])}*100))
+  
+  #--> Format gene names
+  fun_enrich_res_2$geneID <- lapply(fun_enrich_res_2$geneID, format)
+  
+  return(list(Res = fun_enrich_res_2,
+              Levels = levels(fun_enrich_res_2$Description)))
+}
+
+#--> Apply over-representation tests
+test <- lapply(gmt, or_analysis)
+
+#--> Format the output
+test_2 <- list(test[[1]]$Res)
+
+names(test_2) <- c("KEGG")
+
+test_2 <- rbindlist(test_2, use.names = TRUE, idcol = "Database")
+
+test_2$Description <- as.factor(test_2$Description)
+
+levels(test_2$Description) <- c(test[[1]]$Levels)
+
+test_2$Description <- gsub("KEGG_|", "", test_2$Description)
+test_2$Description <- gsub("_", " ", test_2$Description)
+test_2$Description <- str_to_sentence(test_2$Description)
+test_2$Description <- factor(test_2$Description, levels = unique(test_2$Description))
+
+#--> Plot
+p <- ggplot(test_2, aes(y = Description,
+                        x = Cluster,
+                        color = -log10(qvalue),
+                        size = Percent)) +
+  geom_point(shape = 16, stroke = .5, aes(text = gsub("/", " ", geneID))) +
+  scale_color_gradient(low = "firebrick1", high = "chartreuse3") +
+  facet_wrap(vars(Database), scales = "free_y", ncol = 1) +
+  theme() + 
+  scale_y_discrete(labels = label_wrap(70)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        axis.text.y = element_text(size = 8),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.margin = margin(10, 10, 10, 200))
+
+ggplotly(p)
+```
+### Over representation analysis Reactome
+```{r, message=FALSE}
+#---> Split genes according to the module they belong to
+probes <- split(df$gene_name,
+                f = df$cluster)
+
+#--->  Over-representation analysis
+library(ReactomePA)
+library(clusterProfiler)
+library(stringr)
+library(stringi)
+library(data.table)
+library(scales)
+
+#--> Load annotations
+gmt <- list.files("/shared/projects/gliomep53/Stage_M2/Scripts_R/Differential_Analysis/gmt_file/reactome/", full.names = TRUE)
+
+#gmt <- read.gmt("/shared/projects/gliomep53/Scripts_R/Differential_Analysis/gmt_file/reactomev2023.txt")
+
+#--> Create a formatting function for gene names
+format <- function(x) {
+  
+  b <- gregexpr("/", x)[[1]]
+  
+  if (length(b) > 10) {
+    stri_sub_all(x, from = b[seq(from = 10, to = length(b), by = 10)], length = 1) <- " \n "
+    x <- gsub("/", " ", x)
+    
+  }else{
+    x <- gsub("/", " ", x)
+  }
+  
+  return(x)
+}
+
+#--> Create a function for over-representation analysis
+or_analysis <- function(gmt) {
+  
+  gmt <- read.gmt(gmt)
+  
+  fun_enrich_res <- data.frame(compareCluster(probes,
+                                              fun='enricher',
+                                              TERM2GENE=gmt,
+                                              pvalueCutoff =1,
+                                              qvalueCutoff =.2,
+                                              minGSSize = 10))
+  
+  sel <- tapply(fun_enrich_res$Description,
+                INDEX = fun_enrich_res$Cluster,
+                function(x) {y <- x[c(1:5)]
+                return(y)})
+  sel <- unlist(sel)
+  
+  fun_enrich_res_2 <- fun_enrich_res[fun_enrich_res$Description %in%sel,]
+  
+  for (i in sel) {
+    if (nrow(fun_enrich_res_2[which(fun_enrich_res_2$Description == i),]) > 1) {
+      min_p <- min(fun_enrich_res_2[which(fun_enrich_res_2$Description == i),]$pvalue)
+      fun_enrich_res_2[which(fun_enrich_res_2$pvalue > min_p &
+                               fun_enrich_res_2$Description == i),]$qvalue <- NA
+    }}
+  
+  #fun_enrich_res_2 <- fun_enrich_res[which(fun_enrich_res$p.adjust < .1),]
+  
+  #--> Format names
+  fun_enrich_res_2 <- na.omit(fun_enrich_res_2)
+  
+  #--> Order
+  fun_enrich_res_2$Description <- factor(fun_enrich_res_2$Description,
+                                         levels = unique(fun_enrich_res_2$Description))
+  
+  #--> Convert to gene ratios to percent
+  fun_enrich_res_2$Percent <- unlist(lapply(strsplit(fun_enrich_res_2$GeneRatio, "/"), function(x){as.numeric(x[1])/as.numeric(x[2])}*100))
+  
+  #--> Format gene names
+  fun_enrich_res_2$geneID <- lapply(fun_enrich_res_2$geneID, format)
+  
+  return(list(Res = fun_enrich_res_2,
+              Levels = levels(fun_enrich_res_2$Description)))
+}
+
+#--> Apply over-representation tests
+test <- lapply(gmt, or_analysis)
+
+#--> Format the output
+test_2 <- list(test[[1]]$Res)
+
+names(test_2) <- c("Reactome")
+
+test_2 <- rbindlist(test_2, use.names = TRUE, idcol = "Database")
+
+test_2$Description <- as.factor(test_2$Description)
+
+levels(test_2$Description) <- c(test[[1]]$Levels)
+
+test_2$Description <- gsub("REACTOME_|", "", test_2$Description)
+test_2$Description <- gsub("_", " ", test_2$Description)
+test_2$Description <- str_to_sentence(test_2$Description)
+test_2$Description <- factor(test_2$Description, levels = unique(test_2$Description))
+
+#--> Plot
+p <- ggplot(test_2, aes(y = Description,
+                        x = Cluster,
+                        color = -log10(qvalue),
+                        size = Percent)) +
+  geom_point(shape = 16, stroke = .5, aes(text = gsub("/", " ", geneID))) +
+  scale_color_gradient(low = "firebrick1", high = "chartreuse3") +
+  facet_wrap(vars(Database), scales = "free_y", ncol = 1) +
+  theme() + 
+  scale_y_discrete(labels = label_wrap(70)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        axis.text.y = element_text(size = 8),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.margin = margin(10, 10, 10, 200))
+
+ggplotly(p)
+```
