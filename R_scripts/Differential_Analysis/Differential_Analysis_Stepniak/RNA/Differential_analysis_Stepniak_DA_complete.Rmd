@@ -58,7 +58,7 @@ mrna_filter <- HTSFilter(round(mrna_raw_counts),
                          s.min=1, s.max=200)
 ```
 ### Normalization 
-The forst normalization is done with the EDAseq package (v2.28.0) to conduct a "between lane normalization" (to look at sequencing depth and other distributional differences between lanes). Then edgeR package (v1.36.0) is used to perform the differential analysis. First, a DGEList object is created, we apply to this object a normalization by the library size. As edgeR based its analysis on the hypothesis of a negative binomial dispersion of the genes expression, the function "estimateGLMRobustDisp" is applied to perform a robust estimation of the dispersion parameter for each gene.
+The first normalization is done with the EDAseq package (v2.28.0) to conduct a "between lane normalization" (to look at sequencing depth and other distributional differences between lanes). Then edgeR package (v1.36.0) is used to perform the differential analysis. First, a DGEList object is created, we apply to this object a normalization by the library size. As edgeR based its analysis on the hypothesis of a negative binomial dispersion of the genes expression, the function "estimateGLMRobustDisp" is applied to perform a robust estimation of the dispersion parameter for each gene.
 ```{r, message=FALSE}
 library(RUVSeq)
 library(reshape)
