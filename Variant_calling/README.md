@@ -13,7 +13,7 @@ The genome of reference used for alignment has to be **GRCh38**.
 ## Installation  
 
 1. First, load the Variant_calling repository in an easily accessible place on your computer.  
-The following steps are to be carried out in RStudio :  
+**The following steps are to be carried out in RStudio :** 
 2. Then, open RStudio and open the Variant_calling repository from the lower right window, the file browser.  
 3. Once you open the repository, set it as the working directory (more > set as working directory).  
 4. Open the script called Variant_calling_app.R and install the required packages to run the scripts.  
